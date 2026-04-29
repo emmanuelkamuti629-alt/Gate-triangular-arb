@@ -1,4 +1,4 @@
-ccxt-pro>=4.3.0
+import ccxt
 python-dotenv
 fastapi
 uvicorn
