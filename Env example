@@ -1,0 +1,4 @@
+GATEIO_API_KEY=your_key_here
+GATEIO_SECRET=your_secret_here
+TRADE_AMOUNT=50
+MIN_PROFIT_PCT=0.003
