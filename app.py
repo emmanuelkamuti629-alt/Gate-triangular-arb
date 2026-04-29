@@ -28,7 +28,6 @@ bot_status = {
 
 bot_started = False # prevent double startup
 
-
 # =========================
 # LOGGING
 # =========================
@@ -39,19 +38,17 @@ def log(msg):
     bot_status["logs"].append(msg)
     bot_status["logs"] = bot_status["logs"][-50:]
 
-
 # =========================
-# EXCHANGE
+# EXCHANGE - HARDCODED KEYS
 # =========================
 exchange = ccxt.gateio({
-    "apiKey": os.getenv("32861347300e19807010c21562a2f978"),
-    "secret": os.getenv("f8f8243e57f2e2bf222fd326016383fbf8572e9dc5cc5e0f6fb6ce674c352857"),
+    "apiKey": "32861347300e19807010c21562a2f978",
+    "secret": "f8f8243e57f2e2bf222fd326016383fbf8572e9dc5cc5e0f6fb6ce674c352857",
     "enableRateLimit": True,
 })
 
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "5"))
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.01"))
-
 
 # =========================
 # PROFIT CALCULATION
@@ -88,7 +85,6 @@ async def check_profit():
         log(f"CHECK ERROR: {e}")
         return 0
 
-
 # =========================
 # EXECUTION CYCLE
 # =========================
@@ -107,7 +103,6 @@ async def execute_cycle():
     # placeholder for real execution logic
     bot_status["total_trades"] += 1
     bot_status["total_pnl"] += profit_pct * TRADE_AMOUNT
-
 
 # =========================
 # BOT LOOP
@@ -136,7 +131,6 @@ async def bot_loop():
     log("Bot stopped")
     bot_status["running"] = False
 
-
 # =========================
 # FASTAPI STARTUP SAFETY
 # =========================
@@ -146,7 +140,6 @@ async def startup():
     if not bot_started:
         bot_started = True
         asyncio.create_task(bot_loop())
-
 
 # =========================
 # DASHBOARD
@@ -158,12 +151,10 @@ async def dashboard(request: Request):
         {"request": request, "status": bot_status}
     )
 
-
 @app.get("/stop")
 def stop_bot():
     bot_status["stop"] = True
     return {"status": "stopping"}
-
 
 @app.get("/health")
 async def health():
@@ -171,7 +162,6 @@ async def health():
         "status": "ok",
         "running": bot_status["running"]
     }
-
 
 # =========================
 # RUN SERVER
@@ -181,4 +171,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000))
-            )
+)
