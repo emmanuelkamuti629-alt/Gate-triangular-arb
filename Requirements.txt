@@ -1,2 +1,5 @@
 ccxt-pro>=4.3.0
 python-dotenv
+fastapi
+uvicorn
+jinja2
