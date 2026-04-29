@@ -44,8 +44,8 @@ def log(msg):
 # EXCHANGE
 # =========================
 exchange = ccxt.gateio({
-    "apiKey": os.getenv("GATEIO_API_KEY"),
-    "secret": os.getenv("GATEIO_SECRET"),
+    "apiKey": os.getenv("32861347300e19807010c21562a2f978"),
+    "secret": os.getenv("f8f8243e57f2e2bf222fd326016383fbf8572e9dc5cc5e0f6fb6ce674c352857"),
     "enableRateLimit": True,
 })
 
