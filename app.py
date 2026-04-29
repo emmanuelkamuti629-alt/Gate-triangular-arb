@@ -26,7 +26,7 @@ bot_status = {
     "logs": []
 }
 
-bot_started = False  # prevent double startup
+bot_started = False # prevent double startup
 
 
 # =========================
@@ -44,13 +44,13 @@ def log(msg):
 # EXCHANGE
 # =========================
 exchange = ccxt.gateio({
-    "apiKey": os.getenv("32861347300e19807010c21562a2f978"),
-    "secret": os.getenv("f8f8243e57f2e2bf222fd326016383fbf8572e9dc5cc5e0f6fb6ce674c352857"),
+    "apiKey": os.getenv("GATEIO_API_KEY"),
+    "secret": os.getenv("GATEIO_SECRET"),
     "enableRateLimit": True,
 })
 
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", 5))
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", 0.003))
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "5"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.01"))
 
 
 # =========================
@@ -78,7 +78,7 @@ async def check_profit():
         usdt_final = eth_amt * eth_usdt_bid
 
         # realistic cost model
-        fee = 0.003   # 3 legs ~0.1% each
+        fee = 0.003 # 3 legs ~0.1% each
         slippage = 0.0015
 
         profit_pct = (usdt_final / TRADE_AMOUNT) - 1 - fee - slippage
@@ -116,7 +116,12 @@ async def bot_loop():
     bot_status["running"] = True
     log("Bot started")
 
-    await exchange.load_markets()
+    try:
+        await exchange.load_markets()
+    except Exception as e:
+        log(f"Exchange load error: {e}")
+        bot_status["running"] = False
+        return
 
     while not bot_status["stop"]:
         try:
@@ -129,6 +134,7 @@ async def bot_loop():
 
     await exchange.close()
     log("Bot stopped")
+    bot_status["running"] = False
 
 
 # =========================
@@ -175,4 +181,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000))
-        )
+            )
