@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Gate.io Arb Bot</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
+       .stat { margin: 10px 0; }
+       .logs { background: #000; padding: 10px; height: 400px; overflow-y: scroll; }
+    </style>
+</head>
+<body>
+    <h1>Gate.io Triangular Arb Bot</h1>
+    <div class="stat">Status: {{ 'RUNNING' if status.running else 'STOPPED' }}</div>
+    <div class="stat">Last Run: {{ status.last_run }}</div>
+    <div class="stat">Total Trades: {{ status.total_trades }}</div>
+    <div class="stat">Total PnL: {{ status.total_pnl:.4f }} USDT</div>
+    <div class="stat">Last Profit: {{ status.last_profit:.4f }} USDT</div>
+    <h3>Logs:</h3>
+    <div class="logs">
+        {% for log in status.logs[::-1] %}
+        <div>{{ log }}</div>
+        {% endfor %}
+    </div>
+</body>
+</html>
