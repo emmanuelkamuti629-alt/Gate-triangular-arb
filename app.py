@@ -1,340 +1,479 @@
 import asyncio
 import os
+import time
 from dotenv import load_dotenv
-import ccxt.async_support as ccxt  # Using async support instead of pro for stability
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+import ccxt.pro as ccxt
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
-from datetime import datetime
-import time
-from decimal import Decimal, ROUND_DOWN
 
+# =========================
+# ENV
+# =========================
 load_dotenv()
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 # =========================
-# CONFIGURATION
+# CONFIG
 # =========================
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "20"))
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))  # 0.3% minimum
-MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.1"))
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.1"))
+FEE_RATE = 0.002
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+AUTO_TRADE = os.getenv("AUTO_TRADE", "true").lower() == "true"
 
 # =========================
-# STATE MANAGEMENT
+# STATE
 # =========================
-bot_status = {
+state = {
     "running": False,
     "stop": False,
-    "last_run": None,
-    "last_profit": 0,
-    "total_trades": 0,
-    "total_pnl": 0,
-    "successful_trades": 0,
-    "failed_trades": 0,
+    "orderbooks": {},
     "logs": [],
-    "balance": {"usdt": 0},
-    "current_trade_status": "idle",
+    "best": None,
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "realized_pnl": 0.0,
+    "balance": 0.0,
 }
 
 trade_lock = asyncio.Lock()
 
-# Initialize exchange
+# =========================
+# EXCHANGE
+# =========================
 exchange = ccxt.gateio({
     "apiKey": os.getenv("GATEIO_API_KEY"),
     "secret": os.getenv("GATEIO_SECRET"),
     "enableRateLimit": True,
-    "options": {
-        "defaultType": "spot",
-    },
-    "timeout": 30000,
+    "options": {"defaultType": "spot"},
 })
 
 # =========================
 # LOGGING
 # =========================
-def log(msg, level="INFO"):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    msg = f"[{timestamp}] [{level}] {msg}"
-    print(msg)
-    bot_status["logs"].append(msg)
-    bot_status["logs"] = bot_status["logs"][-200:]
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line)
+    state["logs"].append(line)
+    state["logs"] = state["logs"][-200:]
 
 # =========================
-# BALANCE
+# WEBSOCKET MANAGER
+# =========================
+class Manager:
+    def __init__(self):
+        self.clients = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.clients.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.clients:
+            self.clients.remove(ws)
+
+    async def send(self, msg: dict):
+        dead = []
+        for c in self.clients:
+            try:
+                await c.send_json(msg)
+            except:
+                dead.append(c)
+
+        for d in dead:
+            if d in self.clients:
+                self.clients.remove(d)
+
+manager = Manager()
+
+# =========================
+# HEAT MAP
+# =========================
+def heat(pct):
+    if pct < 0.1:
+        return "low"
+    elif pct < 0.3:
+        return "medium"
+    return "high"
+
+# =========================
+# WEBSOCKET STREAM (LIMITED SYMBOLS)
+# =========================
+async def stream_books():
+    """Stream only necessary orderbooks to prevent flooding"""
+    await exchange.load_markets()
+    
+    # Only watch these key pairs for speed
+    symbols = ["BTC/USDT", "ETH/USDT", "ETH/BTC"]
+    
+    log(f"🌊 Streaming {len(symbols)} symbols")
+    
+    while not state["stop"]:
+        try:
+            for symbol in symbols:
+                try:
+                    orderbook = await exchange.watch_order_book(symbol, limit=10)
+                    if orderbook:
+                        state["orderbooks"][symbol] = orderbook
+                except Exception as e:
+                    log(f"WS error {symbol}: {e}")
+                    await asyncio.sleep(0.5)
+                    
+            await asyncio.sleep(0.1)  # Small pause to prevent flooding
+            
+        except Exception as e:
+            log(f"WS stream error: {e}")
+            await asyncio.sleep(1)
+
+# =========================
+# GET BALANCE
 # =========================
 async def update_balance():
     try:
         balance = await exchange.fetch_balance()
-        bot_status["balance"]["usdt"] = balance.get("USDT", {}).get("free", 0)
-        return bot_status["balance"]
+        usdt = balance.get("USDT", {}).get("free", 0)
+        state["balance"] = usdt
+        return usdt
     except Exception as e:
-        log(f"Balance error: {e}", "ERROR")
-        return bot_status["balance"]
+        log(f"Balance error: {e}")
+        return state["balance"]
 
 # =========================
-# PROFIT CALCULATION
+# ORDERBOOK HELPERS
 # =========================
-async def check_triangular_profit():
-    """Check triangular arbitrage: USDT -> BTC -> ETH -> USDT"""
+def get_buy_price(book, usdt_amount):
+    """Get how much crypto you can buy with USDT"""
+    if not book or "asks" not in book or not book["asks"]:
+        return 0, 0
+    
+    spent = 0
+    received = 0
+    weighted_price = 0
+    
+    for price, size in book["asks"]:
+        cost = price * size
+        
+        if spent + cost >= usdt_amount:
+            remaining = usdt_amount - spent
+            received += remaining / price
+            weighted_price = price
+            break
+        else:
+            spent += cost
+            received += size
+            weighted_price = price
+    
+    return received, weighted_price
+
+def get_sell_price(book, crypto_amount):
+    """Get how much USDT you get from selling crypto"""
+    if not book or "bids" not in book or not book["bids"]:
+        return 0, 0
+    
+    received = 0
+    weighted_price = 0
+    remaining = crypto_amount
+    
+    for price, size in book["bids"]:
+        if remaining <= size:
+            received += remaining * price
+            weighted_price = price
+            break
+        else:
+            received += size * price
+            remaining -= size
+            weighted_price = price
+    
+    return received, weighted_price
+
+# =========================
+# TRIANGULAR ARBITRAGE SCAN
+# =========================
+def scan_arbitrage():
+    """Scan BTC/ETH triangle for arbitrage"""
+    ob = state["orderbooks"]
+    
+    # Need all 3 books
+    if "BTC/USDT" not in ob or "ETH/USDT" not in ob or "ETH/BTC" not in ob:
+        return None
+    
     try:
-        # Fetch order books
-        btc_usdt = await exchange.fetch_order_book("BTC/USDT", limit=5)
-        eth_btc = await exchange.fetch_order_book("ETH/BTC", limit=5)
-        eth_usdt = await exchange.fetch_order_book("ETH/USDT", limit=5)
+        btc_usdt = ob["BTC/USDT"]
+        eth_usdt = ob["ETH/USDT"]
+        eth_btc = ob["ETH/BTC"]
         
-        # Validate order books
-        if not btc_usdt['asks'] or not eth_btc['asks'] or not eth_usdt['bids']:
+        # ROUTE 1: USDT -> BTC -> ETH -> USDT
+        btc_amount, btc_price = get_buy_price(btc_usdt, TRADE_AMOUNT)
+        if btc_amount == 0:
             return None
+            
+        eth_amount, eth_btc_price = get_buy_price(eth_btc, btc_amount)
+        if eth_amount == 0:
+            return None
+            
+        final_usdt, eth_price = get_sell_price(eth_usdt, eth_amount)
         
-        # Get prices
-        btc_price = btc_usdt['asks'][0][0]
-        eth_btc_price = eth_btc['asks'][0][0]
-        eth_usdt_price = eth_usdt['bids'][0][0]
+        # Apply fees
+        final_usdt = final_usdt * (1 - FEE_RATE) ** 3
+        profit = final_usdt - TRADE_AMOUNT
+        pct = (profit / TRADE_AMOUNT) * 100
         
-        # Calculate arbitrage
-        # Step 1: Buy BTC with USDT
-        btc_amount = TRADE_AMOUNT / btc_price
+        # ROUTE 2: USDT -> ETH -> BTC -> USDT
+        eth_amount2, eth_price2 = get_buy_price(eth_usdt, TRADE_AMOUNT)
+        if eth_amount2 > 0:
+            btc_amount2, btc_eth_price = get_sell_price(eth_btc, eth_amount2)
+            if btc_amount2 > 0:
+                final_usdt2, btc_price2 = get_sell_price(btc_usdt, btc_amount2)
+                final_usdt2 = final_usdt2 * (1 - FEE_RATE) ** 3
+                profit2 = final_usdt2 - TRADE_AMOUNT
+                pct2 = (profit2 / TRADE_AMOUNT) * 100
+                
+                if pct2 > pct:
+                    return {
+                        "path": "USDT → ETH → BTC → USDT",
+                        "profit": profit2,
+                        "pct": pct2,
+                        "prices": {
+                            "eth_usdt": eth_price2,
+                            "eth_btc": btc_eth_price,
+                            "btc_usdt": btc_price2
+                        }
+                    }
         
-        # Step 2: Buy ETH with BTC
-        eth_amount = btc_amount / eth_btc_price
-        
-        # Step 3: Sell ETH for USDT
-        final_usdt = eth_amount * eth_usdt_price
-        
-        # Calculate fees (0.2% per trade on Gate.io)
-        fee_rate = 0.002
-        fees = (TRADE_AMOUNT * fee_rate) + (btc_amount * btc_price * fee_rate) + (eth_amount * eth_usdt_price * fee_rate)
-        
-        profit = final_usdt - TRADE_AMOUNT - fees
-        profit_pct = (profit / TRADE_AMOUNT) * 100
-        
-        return {
-            'profit_pct': profit_pct,
-            'profit_usd': profit,
-            'path': 'USDT → BTC → ETH → USDT',
-            'prices': {
-                'btc_usdt': btc_price,
-                'eth_btc': eth_btc_price,
-                'eth_usdt': eth_usdt_price
+        if pct > MIN_PROFIT_PCT:
+            return {
+                "path": "USDT → BTC → ETH → USDT",
+                "profit": profit,
+                "pct": pct,
+                "prices": {
+                    "btc_usdt": btc_price,
+                    "eth_btc": eth_btc_price,
+                    "eth_usdt": eth_price
+                }
             }
-        }
+        
+        return None
         
     except Exception as e:
-        log(f"Profit check error: {e}", "ERROR")
+        log(f"Scan error: {e}")
         return None
 
 # =========================
-# EXECUTION ENGINE
+# EXECUTE TRADE
 # =========================
-async def execute_arbitrage(opportunity):
-    """Execute the triangular arbitrage"""
+async def execute_trade(opp):
+    """Execute the arbitrage trade"""
+    if trade_lock.locked():
+        return False
+    
     async with trade_lock:
-        if bot_status["current_trade_status"] != "idle":
-            return False
+        log(f"🚀 EXECUTING: {opp['path']} | {opp['pct']:.3f}%")
         
-        bot_status["current_trade_status"] = "executing"
-        start_time = time.time()
-        
-        try:
-            log(f"🚀 EXECUTING: {opportunity['path']}", "WARNING")
-            log(f"Expected profit: {opportunity['profit_pct']:.4f}% (${opportunity['profit_usd']:.4f})")
-            
-            if DRY_RUN:
-                log("[DRY RUN] Would execute 3 trades:", "INFO")
-                log(f"  [DRY RUN] 1. Buy BTC with ${TRADE_AMOUNT} USDT")
-                log(f"  [DRY RUN] 2. Buy ETH with BTC")
-                log(f"  [DRY RUN] 3. Sell ETH for USDT")
-                
-                # Simulate success
-                bot_status["total_trades"] += 1
-                bot_status["successful_trades"] += 1
-                bot_status["total_pnl"] += opportunity['profit_usd']
-                bot_status["last_profit"] = opportunity['profit_pct']
-                
-                execution_time = (time.time() - start_time) * 1000
-                log(f"💰 [DRY RUN] Profit: ${opportunity['profit_usd']:.4f} in {execution_time:.0f}ms", "SUCCESS")
-                
+        if DRY_RUN:
+            state["trades"] += 1
+            if opp["profit"] > 0:
+                state["wins"] += 1
             else:
-                # REAL EXECUTION
-                # Leg 1: Buy BTC
-                log("📍 LEG 1/3: Buying BTC with USDT...")
-                btc_amount = TRADE_AMOUNT / opportunity['prices']['btc_usdt']
+                state["losses"] += 1
+            state["realized_pnl"] += opp["profit"]
+            log(f"💰 [DRY RUN] Profit: ${opp['profit']:.4f}")
+            return True
+        
+        # REAL TRADING (when ready)
+        try:
+            if "BTC → ETH" in opp["path"]:
+                # Buy BTC
                 order1 = await exchange.create_order(
                     "BTC/USDT", "market", "buy",
-                    btc_amount
+                    TRADE_AMOUNT / opp["prices"]["btc_usdt"]
                 )
-                log(f"✅ LEG 1: Bought {order1['filled']:.6f} BTC at ${order1['average']:.2f}")
-                
-                # Leg 2: Buy ETH with BTC
-                log("📍 LEG 2/3: Buying ETH with BTC...")
-                eth_amount = order1['filled'] / opportunity['prices']['eth_btc']
+                # Buy ETH with BTC
                 order2 = await exchange.create_order(
                     "ETH/BTC", "market", "buy",
-                    eth_amount
+                    order1["filled"]
                 )
-                log(f"✅ LEG 2: Bought {order2['filled']:.6f} ETH")
-                
-                # Leg 3: Sell ETH for USDT
-                log("📍 LEG 3/3: Selling ETH for USDT...")
+                # Sell ETH
                 order3 = await exchange.create_order(
                     "ETH/USDT", "market", "sell",
-                    order2['filled']
+                    order2["filled"]
                 )
-                log(f"✅ LEG 3: Sold for ${order3['cost']:.2f} USDT")
                 
-                # Calculate actual profit
-                actual_profit = order3['cost'] - TRADE_AMOUNT
-                execution_time = (time.time() - start_time) * 1000
+                profit = order3["cost"] - TRADE_AMOUNT
                 
-                bot_status["total_trades"] += 1
-                bot_status["successful_trades"] += 1
-                bot_status["total_pnl"] += actual_profit
-                bot_status["last_profit"] = (actual_profit / TRADE_AMOUNT) * 100
+            else:
+                # Buy ETH
+                order1 = await exchange.create_order(
+                    "ETH/USDT", "market", "buy",
+                    TRADE_AMOUNT / opp["prices"]["eth_usdt"]
+                )
+                # Sell ETH for BTC
+                order2 = await exchange.create_order(
+                    "ETH/BTC", "market", "sell",
+                    order1["filled"]
+                )
+                # Sell BTC
+                order3 = await exchange.create_order(
+                    "BTC/USDT", "market", "sell",
+                    order2["filled"]
+                )
                 
-                log(f"💰 REAL PROFIT: ${actual_profit:.4f} in {execution_time:.0f}ms", "SUCCESS")
+                profit = order3["cost"] - TRADE_AMOUNT
             
-            await update_balance()
-            bot_status["current_trade_status"] = "idle"
+            state["trades"] += 1
+            state["wins"] += 1 if profit > 0 else 0
+            state["losses"] += 1 if profit <= 0 else 0
+            state["realized_pnl"] += profit
+            
+            log(f"💰 REAL PROFIT: ${profit:.4f}")
             return True
             
         except Exception as e:
-            log(f"❌ EXECUTION FAILED: {e}", "ERROR")
-            bot_status["failed_trades"] += 1
-            bot_status["total_trades"] += 1
-            bot_status["current_trade_status"] = "idle"
+            log(f"❌ Trade failed: {e}")
+            state["losses"] += 1
             return False
 
 # =========================
-# MAIN BOT LOOP
+# MAIN ENGINE
 # =========================
-async def bot_loop():
-    """Main bot loop"""
-    bot_status["running"] = True
-    log("🚀 ARBITRAGE BOT STARTED", "WARNING")
-    log(f"Mode: {'DRY RUN (no real trades)' if DRY_RUN else 'LIVE TRADING'}")
-    log(f"Trade amount: ${TRADE_AMOUNT} USDT")
-    log(f"Min profit required: {MIN_PROFIT_PCT}%")
+async def engine():
+    """Main bot engine"""
+    state["running"] = True
     
-    # Load markets
-    try:
-        await exchange.load_markets()
-        log("✅ Markets loaded successfully")
-    except Exception as e:
-        log(f"Failed to load markets: {e}", "ERROR")
-        bot_status["running"] = False
-        return
+    # Get balance
+    balance = await update_balance()
+    log(f"💰 Balance: ${balance:.2f} USDT")
     
-    # Get initial balance
-    await update_balance()
-    log(f"💰 Starting balance: ${bot_status['balance']['usdt']:.2f} USDT")
+    if balance < TRADE_AMOUNT and not DRY_RUN:
+        log(f"⚠️ Insufficient balance! Need ${TRADE_AMOUNT}, have ${balance:.2f}")
     
-    cycle_count = 0
-    last_log_time = time.time()
+    # Start WebSocket stream
+    stream_task = asyncio.create_task(stream_books())
     
-    while not bot_status["stop"]:
+    log("🔍 Scanning for arbitrage opportunities...")
+    
+    scan_count = 0
+    last_log = time.time()
+    
+    while not state["stop"]:
         try:
-            cycle_count += 1
-            bot_status["last_run"] = datetime.now().strftime("%H:%M:%S")
+            # Scan for opportunities
+            best = scan_arbitrage()
+            scan_count += 1
             
-            # Check for opportunity
-            opportunity = await check_triangular_profit()
+            if best:
+                state["best"] = best
+                
+                # Send to WebSocket clients
+                await manager.send({
+                    "type": "update",
+                    "path": best["path"],
+                    "profit": best["profit"],
+                    "pct": best["pct"],
+                    "heat": heat(best["pct"])
+                })
+                
+                # Log every 5 seconds
+                if time.time() - last_log > 5:
+                    log(f"📊 Best: {best['pct']:.3f}% | {best['path']}")
+                    last_log = time.time()
+                
+                # Execute if profitable
+                if AUTO_TRADE and best["pct"] > MIN_PROFIT_PCT and best["profit"] > 0:
+                    await execute_trade(best)
             
-            # Log every 10 seconds
-            if time.time() - last_log_time > 10:
-                if opportunity:
-                    log(f"📊 Opportunity: {opportunity['profit_pct']:.4f}% profit potential")
-                else:
-                    log(f"📊 No opportunities found (cycle #{cycle_count})")
-                last_log_time = time.time()
+            # Update balance periodically
+            if scan_count % 20 == 0:
+                await update_balance()
             
-            # Execute if profitable
-            if opportunity and opportunity['profit_pct'] > MIN_PROFIT_PCT:
-                log(f"🎯 PROFITABLE OPPORTUNITY: {opportunity['profit_pct']:.3f}%")
-                await execute_arbitrage(opportunity)
-            
-            # Wait before next check
-            await asyncio.sleep(3)  # Check every 3 seconds
+            await asyncio.sleep(0.5)  # Scan every 0.5 seconds
             
         except Exception as e:
-            log(f"Loop error: {e}", "ERROR")
-            await asyncio.sleep(5)
+            log(f"Engine error: {e}")
+            await asyncio.sleep(1)
+    
+    # Cleanup
+    stream_task.cancel()
+    try:
+        await stream_task
+    except:
+        pass
     
     await exchange.close()
-    bot_status["running"] = False
-    log("Bot stopped")
+    state["running"] = False
+    log("🛑 Engine stopped")
 
 # =========================
-# FASTAPI ENDPOINTS
+# FASTAPI ROUTES
 # =========================
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     log("🌐 Arbitrage Bot API Ready")
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def home(request: Request):
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "status": bot_status,
+        "state": state,
         "dry_run": DRY_RUN
     })
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
 @app.get("/api/status")
-async def api_status():
+async def get_status():
     return {
-        "running": bot_status["running"],
-        "dry_run": DRY_RUN,
-        "current_trade_status": bot_status["current_trade_status"],
-        "total_trades": bot_status["total_trades"],
-        "successful_trades": bot_status["successful_trades"],
-        "failed_trades": bot_status["failed_trades"],
-        "total_pnl": round(bot_status["total_pnl"], 2),
-        "balance_usdt": round(bot_status["balance"]["usdt"], 2),
-        "last_profit": round(bot_status["last_profit"], 4),
-        "last_run": bot_status["last_run"]
+        "running": state["running"],
+        "balance": state["balance"],
+        "trades": state["trades"],
+        "wins": state["wins"],
+        "losses": state["losses"],
+        "realized_pnl": state["realized_pnl"],
+        "best": state["best"]
     }
 
 @app.get("/api/balance")
-async def api_balance():
+async def get_balance():
     await update_balance()
-    return {"usdt": round(bot_status["balance"]["usdt"], 2)}
-
-@app.get("/api/logs")
-async def api_logs(limit: int = 50):
-    return {"logs": bot_status["logs"][-limit:]}
+    return {"usdt": state["balance"]}
 
 @app.get("/start")
 async def start_bot():
-    if bot_status["running"]:
-        return {"status": "already_running", "message": "Bot is already running"}
+    if state["running"]:
+        return {"status": "already_running"}
     
-    bot_status["stop"] = False
-    asyncio.create_task(bot_loop())
-    return {"status": "started", "message": "Bot started"}
+    state["stop"] = False
+    asyncio.create_task(engine())
+    return {"status": "started"}
 
 @app.get("/stop")
 async def stop_bot():
-    if not bot_status["running"]:
-        return {"status": "not_running", "message": "Bot is not running"}
-    
-    bot_status["stop"] = True
-    return {"status": "stopping", "message": "Bot stopping..."}
+    state["stop"] = True
+    return {"status": "stopping"}
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "running": bot_status["running"],
-        "dry_run": DRY_RUN,
-        "total_trades": bot_status["total_trades"]
+        "running": state["running"],
+        "books": len(state["orderbooks"])
     }
 
 # =========================
-# RUN SERVER
+# RUN
 # =========================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
