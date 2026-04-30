@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: triangular-arb-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GATEIO_API_KEY
+        sync: false  # Set this in Render dashboard, not GitHub
+      - key: GATEIO_SECRET
+        sync: false
+      - key: TRADE_AMOUNT
+        value: "10"
+      - key: MIN_PROFIT_PCT
+        value: "0.5"
+      - key: DRY_RUN
+        value: "true"
