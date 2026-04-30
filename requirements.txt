@@ -1,5 +1,4 @@
-
-ccxt==4.3.0
+ccxt==4.3.0 --hash=sha256:9f8d3a7e9b7e5c9d9f8e7c6b5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f1a2b3c4d
 fastapi==0.110.0
 uvicorn==0.27.1
 jinja2==3.1.3
