@@ -1,150 +1,49 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Triangular Arbitrage Bot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Arbitrage Bot</title>
     <style>
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
-            margin: 20px; 
-            background: #0d1117; 
-            color: #c9d1d9;
-        }
-        .container { 
-            max-width: 900px; 
-            margin: 0 auto; 
-            background: #161b22; 
-            padding: 20px; 
-            border-radius: 10px; 
-        }
-        h1 { color: #58a6ff; }
-        .status { 
-            padding: 10px; 
-            border-radius: 5px; 
-            margin: 10px 0; 
-            font-weight: bold;
-        }
-        .running { background: #0f5323; color: #fff; }
-        .stopped { background: #da3633; color: #fff; }
-        .dry-run { background: #6e4600; color: #fff; }
-        .stat-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 10px;
-            margin: 15px 0;
-        }
-        .stat { 
-            padding: 10px;
-            background: #0d1117;
-            border-radius: 5px;
-            border-left: 3px solid #58a6ff;
-        }
-        .stat-value {
-            font-size: 20px;
-            font-weight: bold;
-            margin-top: 5px;
-        }
-        button { 
-            background: #238636; 
-            color: white; 
-            border: none; 
-            padding: 10px 20px; 
-            border-radius: 5px; 
-            cursor: pointer; 
-            font-size: 16px;
-            margin: 5px;
-        }
-        button:hover { background: #2ea043; }
+        body { font-family: Arial; background: #0d1117; color: white; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: #161b22; padding: 20px; border-radius: 10px; }
+        .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .running { background: #0f5323; }
+        .stopped { background: #da3633; }
+        .dry-run { background: #6e4600; }
+        .stat { margin: 10px 0; padding: 10px; background: #0d1117; border-radius: 5px; }
+        button { background: #238636; padding: 10px 20px; margin: 5px; cursor: pointer; border: none; border-radius: 5px; color: white; }
         .stop-btn { background: #da3633; }
-        .stop-btn:hover { background: #f85149; }
-        .log { 
-            background: #0d1117; 
-            padding: 10px; 
-            border-radius: 5px; 
-            font-family: monospace; 
-            font-size: 12px;
-            height: 300px; 
-            overflow-y: scroll; 
-        }
-        .log-entry { 
-            border-bottom: 1px solid #21262d; 
-            padding: 5px 0;
-            font-family: monospace;
-        }
+        .log { background: #0d1117; padding: 10px; height: 300px; overflow-y: scroll; font-family: monospace; font-size: 12px; margin-top: 10px; }
     </style>
-    <script>
-        async function startBot() {
-            const response = await fetch('/start');
-            const data = await response.json();
-            alert(data.message);
-            setTimeout(() => location.reload(), 1000);
-        }
-        
-        async function stopBot() {
-            if (confirm('Stop the bot?')) {
-                const response = await fetch('/stop');
-                const data = await response.json();
-                alert(data.message);
-                setTimeout(() => location.reload(), 1000);
-            }
-        }
-        
-        setInterval(() => location.reload(), 15000);
-    </script>
 </head>
 <body>
     <div class="container">
         <h1>🔄 Triangular Arbitrage Bot</h1>
         
-        <div class="status {% if status.running %}running{% else %}stopped{% endif %}">
-            {% if status.running %}🟢 RUNNING{% else %}🔴 STOPPED{% endif %}
+        <div class="status {% if state.running %}running{% else %}stopped{% endif %}">
+            {% if state.running %}🟢 RUNNING{% else %}🔴 STOPPED{% endif %}
         </div>
         
         {% if dry_run %}
-        <div class="status dry-run">
-            ⚠️ DRY RUN MODE - No real trades
-        </div>
+        <div class="status dry-run">⚠️ DRY RUN MODE - No real trades</div>
         {% endif %}
         
-        <div class="stat-grid">
-            <div class="stat">
-                <div>💰 USDT Balance</div>
-                <div class="stat-value">${{ "%.2f"|format(status.balance.usdt) }}</div>
-            </div>
-            <div class="stat">
-                <div>📊 Total Trades</div>
-                <div class="stat-value">{{ status.total_trades }}</div>
-            </div>
-            <div class="stat">
-                <div>✅ Successful</div>
-                <div class="stat-value">{{ status.successful_trades }}</div>
-            </div>
-            <div class="stat">
-                <div>❌ Failed</div>
-                <div class="stat-value">{{ status.failed_trades }}</div>
-            </div>
-            <div class="stat">
-                <div>💰 Total PnL</div>
-                <div class="stat-value">${{ "%.2f"|format(status.total_pnl) }}</div>
-            </div>
-            <div class="stat">
-                <div>📈 Last Profit</div>
-                <div class="stat-value">{{ "%.4f"|format(status.last_profit) }}%</div>
-            </div>
-        </div>
+        <div class="stat">💰 Balance: ${{ "%.2f"|format(state.balance) }}</div>
+        <div class="stat">📊 Trades: {{ state.trades }}</div>
+        <div class="stat">✅ Wins: {{ state.wins }}</div>
+        <div class="stat">💰 PnL: ${{ "%.2f"|format(state.realized_pnl) }}</div>
         
-        <div style="margin: 20px 0;">
-            {% if not status.running %}
-            <button onclick="startBot()">▶️ Start Bot</button>
+        <div>
+            {% if not state.running %}
+            <button onclick="fetch('/start').then(()=>location.reload())">▶️ Start</button>
             {% else %}
-            <button class="stop-btn" onclick="stopBot()">⏹️ Stop Bot</button>
+            <button class="stop-btn" onclick="fetch('/stop').then(()=>location.reload())">⏹️ Stop</button>
             {% endif %}
         </div>
         
-        <h3>📝 Live Logs</h3>
+        <h3>📝 Logs</h3>
         <div class="log">
-            {% for log in status.logs|reverse %}
-            <div class="log-entry">{{ log }}</div>
+            {% for log in state.logs|reverse %}
+            <div>{{ log }}</div>
             {% endfor %}
         </div>
     </div>
