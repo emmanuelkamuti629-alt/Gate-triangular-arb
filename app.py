@@ -4,9 +4,8 @@ import time
 from dotenv import load_dotenv
 import ccxt.async_support as ccxt
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 import uvicorn
 
 # =========================
@@ -15,7 +14,6 @@ import uvicorn
 load_dotenv()
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
 
 # =========================
 # CONFIG
@@ -79,7 +77,6 @@ async def update_balance():
 # FETCH ORDERBOOKS
 # =========================
 async def fetch_orderbooks():
-    """Fetch current orderbooks"""
     try:
         btc_usdt = await exchange.fetch_order_book("BTC/USDT", limit=10)
         eth_usdt = await exchange.fetch_order_book("ETH/USDT", limit=10)
@@ -139,7 +136,6 @@ def get_sell_price(book, crypto_amount):
 # SCAN ARBITRAGE
 # =========================
 async def scan_arbitrage():
-    """Scan BTC/ETH triangle for arbitrage"""
     btc_usdt, eth_usdt, eth_btc = await fetch_orderbooks()
     
     if not btc_usdt or not eth_usdt or not eth_btc:
@@ -235,7 +231,7 @@ async def engine():
                 if AUTO_TRADE and best["pct"] > MIN_PROFIT_PCT and best["profit"] > 0:
                     await execute_trade(best)
             
-            await asyncio.sleep(2)  # Scan every 2 seconds
+            await asyncio.sleep(2)
             
         except Exception as e:
             log(f"Engine error: {e}")
@@ -246,6 +242,280 @@ async def engine():
     log("🛑 Engine stopped")
 
 # =========================
+# HTML DASHBOARD (embedded)
+# =========================
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Arbitrage Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
+            background: #0a0c10; 
+            color: #e6edf3; 
+            padding: 20px;
+        }
+        .container { 
+            max-width: 900px; 
+            margin: 0 auto; 
+            background: #161b22; 
+            padding: 24px; 
+            border-radius: 16px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        h1 { 
+            color: #58a6ff; 
+            font-size: 28px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status { 
+            padding: 12px; 
+            border-radius: 8px; 
+            margin: 16px 0; 
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .running { background: #0f5323; border-left: 4px solid #56d364; }
+        .stopped { background: #5a1e1e; border-left: 4px solid #f85149; }
+        .dry-run { background: #6e4600; border-left: 4px solid #f0883e; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin: 20px 0;
+        }
+        .stat-card {
+            background: #0d1117;
+            padding: 16px;
+            border-radius: 12px;
+            border: 1px solid #30363d;
+        }
+        .stat-label {
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .stat-value {
+            font-size: 28px;
+            font-weight: bold;
+            margin-top: 8px;
+        }
+        .profit { color: #56d364; }
+        .loss { color: #f85149; }
+        .best-card {
+            background: #1f6feb;
+            padding: 16px;
+            border-radius: 12px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .best-path {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+        .best-profit {
+            font-size: 32px;
+            font-weight: bold;
+        }
+        button {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            margin: 8px;
+            cursor: pointer;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.2s;
+        }
+        button:hover { background: #2ea043; transform: scale(1.02); }
+        .stop-btn { background: #da3633; }
+        .stop-btn:hover { background: #f85149; }
+        .logs {
+            background: #0d1117;
+            padding: 16px;
+            border-radius: 12px;
+            height: 350px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            margin-top: 20px;
+            border: 1px solid #30363d;
+        }
+        .log-entry {
+            padding: 6px 0;
+            border-bottom: 1px solid #21262d;
+            font-family: monospace;
+        }
+        .refresh-btn {
+            background: #1f6feb;
+            font-size: 14px;
+            padding: 8px 16px;
+        }
+        .footer {
+            margin-top: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #8b949e;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        .scanning {
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            <span>🔄</span> 
+            Triangular Arbitrage Bot
+            <span id="scanIcon" style="font-size: 14px;"></span>
+        </h1>
+        
+        <div id="statusDiv" class="status running">🟢 LOADING...</div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-label">💰 USDT Balance</div>
+                <div class="stat-value" id="balance">$0.00</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">📊 Total Trades</div>
+                <div class="stat-value" id="trades">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">✅ Wins / ❌ Losses</div>
+                <div class="stat-value" id="winsLosses">0 / 0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">💰 Total PnL</div>
+                <div class="stat-value" id="pnl">$0.00</div>
+            </div>
+        </div>
+        
+        <div id="bestDiv" style="display: none;" class="best-card">
+            <div class="best-path" id="bestPath"></div>
+            <div class="best-profit" id="bestProfit"></div>
+        </div>
+        
+        <div>
+            <button id="startBtn" onclick="startBot()">▶️ Start Bot</button>
+            <button id="stopBtn" onclick="stopBot()" class="stop-btn" style="display: none;">⏹️ Stop Bot</button>
+            <button onclick="refreshData()" class="refresh-btn">🔄 Refresh</button>
+        </div>
+        
+        <h3 style="margin-top: 20px;">📝 Live Logs</h3>
+        <div class="logs" id="logs">
+            <div class="log-entry">Waiting for bot to start...</div>
+        </div>
+        
+        <div class="footer">
+            ⚡ Scan every 2 seconds | Fee: 0.2% | DRY RUN MODE
+        </div>
+    </div>
+
+    <script>
+        async function refreshData() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                
+                // Update stats
+                document.getElementById('balance').innerHTML = `$${data.balance.toFixed(2)}`;
+                document.getElementById('trades').innerHTML = data.trades;
+                document.getElementById('winsLosses').innerHTML = `${data.wins} / ${data.losses}`;
+                
+                const pnlElem = document.getElementById('pnl');
+                pnlElem.innerHTML = `$${data.realized_pnl.toFixed(2)}`;
+                if (data.realized_pnl >= 0) {
+                    pnlElem.className = 'stat-value profit';
+                } else {
+                    pnlElem.className = 'stat-value loss';
+                }
+                
+                // Update status
+                const statusDiv = document.getElementById('statusDiv');
+                if (data.running) {
+                    statusDiv.innerHTML = '🟢 RUNNING';
+                    statusDiv.className = 'status running';
+                    document.getElementById('startBtn').style.display = 'none';
+                    document.getElementById('stopBtn').style.display = 'inline-block';
+                    document.getElementById('scanIcon').innerHTML = '⚡ scanning...';
+                    document.getElementById('scanIcon').className = 'scanning';
+                } else {
+                    statusDiv.innerHTML = '🔴 STOPPED';
+                    statusDiv.className = 'status stopped';
+                    document.getElementById('startBtn').style.display = 'inline-block';
+                    document.getElementById('stopBtn').style.display = 'none';
+                    document.getElementById('scanIcon').innerHTML = '';
+                }
+                
+                // Update best opportunity
+                if (data.best && data.best.pct) {
+                    const bestDiv = document.getElementById('bestDiv');
+                    bestDiv.style.display = 'block';
+                    document.getElementById('bestPath').innerHTML = data.best.path;
+                    const profitClass = data.best.profit >= 0 ? 'profit' : 'loss';
+                    document.getElementById('bestProfit').innerHTML = `${data.best.pct.toFixed(4)}% ($${data.best.profit.toFixed(4)})`;
+                    document.getElementById('bestProfit').className = `best-profit ${profitClass}`;
+                } else {
+                    document.getElementById('bestDiv').style.display = 'none';
+                }
+            } catch(e) {
+                console.error(e);
+            }
+        }
+        
+        async function refreshLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const data = await res.json();
+                const logsDiv = document.getElementById('logs');
+                logsDiv.innerHTML = data.logs.map(log => `<div class="log-entry">${escapeHtml(log)}</div>`).join('');
+                logsDiv.scrollTop = logsDiv.scrollHeight;
+            } catch(e) {
+                console.error(e);
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        async function startBot() {
+            await fetch('/start');
+            setTimeout(() => refreshData(), 500);
+        }
+        
+        async function stopBot() {
+            await fetch('/stop');
+            setTimeout(() => refreshData(), 500);
+        }
+        
+        refreshData();
+        refreshLogs();
+        setInterval(refreshData, 3000);
+        setInterval(refreshLogs, 2000);
+    </script>
+</body>
+</html>
+"""
+
+# =========================
 # FASTAPI ROUTES
 # =========================
 @app.on_event("startup")
@@ -253,12 +523,8 @@ async def startup():
     log("🌐 Arbitrage Bot API Ready")
 
 @app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "state": state,
-        "dry_run": DRY_RUN
-    })
+async def home():
+    return HTMLResponse(content=HTML_PAGE)
 
 @app.get("/api/status")
 async def get_status():
@@ -271,6 +537,10 @@ async def get_status():
         "realized_pnl": state["realized_pnl"],
         "best": state["best"]
     }
+
+@app.get("/api/logs")
+async def get_logs():
+    return {"logs": state["logs"]}
 
 @app.get("/start")
 async def start_bot():
