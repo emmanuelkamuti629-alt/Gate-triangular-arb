@@ -2,8 +2,7 @@ import asyncio
 import os
 import time
 from dotenv import load_dotenv
-import ccxt.async_support as ccxt
-
+import ccxt.pro as ccxt
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
@@ -15,31 +14,10 @@ load_dotenv()
 
 app = FastAPI()
 
-# =========================
-# CONFIG
-# =========================
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "20"))
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.1"))
-FEE_RATE = 0.002
+FEE = 0.002
+MIN_PROFIT = float(os.getenv("MIN_PROFIT_PCT", "0.2"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-AUTO_TRADE = os.getenv("AUTO_TRADE", "true").lower() == "true"
-
-# =========================
-# STATE
-# =========================
-state = {
-    "running": False,
-    "stop": False,
-    "logs": [],
-    "best": None,
-    "trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "realized_pnl": 0.0,
-    "balance": 0.0,
-}
-
-trade_lock = asyncio.Lock()
 
 # =========================
 # EXCHANGE
@@ -52,6 +30,27 @@ exchange = ccxt.gateio({
 })
 
 # =========================
+# LIVE ORDERBOOK CACHE
+# =========================
+orderbooks = {
+    "BTC/USDT": None,
+    "ETH/USDT": None,
+    "ETH/BTC": None,
+}
+
+# =========================
+# STATE
+# =========================
+state = {
+    "running": False,
+    "stop": False,
+    "logs": [],
+    "best": None,
+    "trades": 0,
+    "total_profit": 0.0,
+}
+
+# =========================
 # LOGGING
 # =========================
 def log(msg):
@@ -61,421 +60,206 @@ def log(msg):
     state["logs"] = state["logs"][-200:]
 
 # =========================
-# GET BALANCE
+# WEBSOCKET STREAMS
 # =========================
-async def update_balance():
-    try:
-        balance = await exchange.fetch_balance()
-        usdt = balance.get("USDT", {}).get("free", 0)
-        state["balance"] = usdt
-        return usdt
-    except Exception as e:
-        log(f"Balance error: {e}")
-        return state["balance"]
+async def stream(symbol):
+    while not state["stop"]:
+        try:
+            book = await exchange.watch_order_book(symbol, limit=10)
+            if book:
+                orderbooks[symbol] = book
+        except Exception as e:
+            log(f"WS ERROR {symbol}: {e}")
+            await asyncio.sleep(1)
 
 # =========================
-# FETCH ORDERBOOKS
+# PRICE HELPERS
 # =========================
-async def fetch_orderbooks():
-    try:
-        btc_usdt = await exchange.fetch_order_book("BTC/USDT", limit=10)
-        eth_usdt = await exchange.fetch_order_book("ETH/USDT", limit=10)
-        eth_btc = await exchange.fetch_order_book("ETH/BTC", limit=10)
-        return btc_usdt, eth_usdt, eth_btc
-    except Exception as e:
-        log(f"Fetch error: {e}")
-        return None, None, None
+def get_prices(book):
+    if not book or not book["bids"] or not book["asks"]:
+        return None, None
+    return book["bids"][0][0], book["asks"][0][0]
 
 # =========================
-# ORDERBOOK HELPERS
+# ARBITRAGE CALCULATION
 # =========================
-def get_buy_price(book, usdt_amount):
-    if not book or "asks" not in book or not book["asks"]:
-        return 0, 0
-    
-    spent = 0
-    received = 0
-    weighted_price = 0
-    
-    for price, size in book["asks"]:
-        cost = price * size
-        
-        if spent + cost >= usdt_amount:
-            remaining = usdt_amount - spent
-            received += remaining / price
-            weighted_price = price
-            break
-        else:
-            spent += cost
-            received += size
-            weighted_price = price
-    
-    return received, weighted_price
+def scan_opportunity():
+    btc = orderbooks["BTC/USDT"]
+    eth = orderbooks["ETH/USDT"]
+    ethbtc = orderbooks["ETH/BTC"]
 
-def get_sell_price(book, crypto_amount):
-    if not book or "bids" not in book or not book["bids"]:
-        return 0, 0
-    
-    received = 0
-    weighted_price = 0
-    remaining = crypto_amount
-    
-    for price, size in book["bids"]:
-        if remaining <= size:
-            received += remaining * price
-            weighted_price = price
-            break
-        else:
-            received += size * price
-            remaining -= size
-            weighted_price = price
-    
-    return received, weighted_price
-
-# =========================
-# SCAN ARBITRAGE
-# =========================
-async def scan_arbitrage():
-    btc_usdt, eth_usdt, eth_btc = await fetch_orderbooks()
-    
-    if not btc_usdt or not eth_usdt or not eth_btc:
-        return None
-    
-    try:
-        # ROUTE 1: USDT -> BTC -> ETH -> USDT
-        btc_amount, btc_price = get_buy_price(btc_usdt, TRADE_AMOUNT)
-        if btc_amount > 0:
-            eth_amount, eth_btc_price = get_buy_price(eth_btc, btc_amount)
-            if eth_amount > 0:
-                final_usdt, eth_price = get_sell_price(eth_usdt, eth_amount)
-                final_usdt = final_usdt * (1 - FEE_RATE) ** 3
-                profit = final_usdt - TRADE_AMOUNT
-                pct = (profit / TRADE_AMOUNT) * 100
-                
-                if pct > MIN_PROFIT_PCT:
-                    return {
-                        "path": "USDT → BTC → ETH → USDT",
-                        "profit": profit,
-                        "pct": pct,
-                    }
-        
-        # ROUTE 2: USDT -> ETH -> BTC -> USDT
-        eth_amount2, eth_price2 = get_buy_price(eth_usdt, TRADE_AMOUNT)
-        if eth_amount2 > 0:
-            btc_amount2, btc_eth_price = get_sell_price(eth_btc, eth_amount2)
-            if btc_amount2 > 0:
-                final_usdt2, btc_price2 = get_sell_price(btc_usdt, btc_amount2)
-                final_usdt2 = final_usdt2 * (1 - FEE_RATE) ** 3
-                profit2 = final_usdt2 - TRADE_AMOUNT
-                pct2 = (profit2 / TRADE_AMOUNT) * 100
-                
-                if pct2 > MIN_PROFIT_PCT:
-                    return {
-                        "path": "USDT → ETH → BTC → USDT",
-                        "profit": profit2,
-                        "pct": pct2,
-                    }
-        
-        return None
-        
-    except Exception as e:
-        log(f"Scan error: {e}")
+    if not btc or not eth or not ethbtc:
         return None
 
+    btc_bid, btc_ask = get_prices(btc)
+    eth_bid, eth_ask = get_prices(eth)
+    ethbtc_bid, ethbtc_ask = get_prices(ethbtc)
+
+    if None in [btc_bid, btc_ask, eth_bid, eth_ask, ethbtc_bid, ethbtc_ask]:
+        return None
+
+    # ROUTE 1: USDT → BTC → ETH → USDT
+    btc_amt = TRADE_AMOUNT / btc_ask
+    eth_amt = btc_amt / ethbtc_ask
+    final_usdt = eth_amt * eth_bid
+    final_usdt *= (1 - FEE) ** 3
+    profit1 = final_usdt - TRADE_AMOUNT
+    pct1 = (profit1 / TRADE_AMOUNT) * 100
+
+    # ROUTE 2: USDT → ETH → BTC → USDT
+    eth_amt2 = TRADE_AMOUNT / eth_ask
+    btc_amt2 = eth_amt2 * ethbtc_bid
+    final_usdt2 = btc_amt2 * btc_bid
+    final_usdt2 *= (1 - FEE) ** 3
+    profit2 = final_usdt2 - TRADE_AMOUNT
+    pct2 = (profit2 / TRADE_AMOUNT) * 100
+
+    # Find best
+    if pct1 > MIN_PROFIT and pct1 >= pct2:
+        return {"route": "USDT → BTC → ETH → USDT", "pct": pct1, "profit": profit1}
+    elif pct2 > MIN_PROFIT:
+        return {"route": "USDT → ETH → BTC → USDT", "pct": pct2, "profit": profit2}
+
+    return None
+
 # =========================
-# EXECUTE TRADE
+# EXECUTION
 # =========================
 async def execute_trade(opp):
-    if trade_lock.locked():
-        return False
-    
-    async with trade_lock:
-        log(f"🚀 EXECUTING: {opp['path']} | {opp['pct']:.3f}%")
-        
-        if DRY_RUN:
-            state["trades"] += 1
-            if opp["profit"] > 0:
-                state["wins"] += 1
-            else:
-                state["losses"] += 1
-            state["realized_pnl"] += opp["profit"]
-            log(f"💰 [DRY RUN] Profit: ${opp['profit']:.4f}")
-            return True
-        
-        return False
+    log(f"🚀 {opp['route']} | {opp['pct']:.3f}% | ${opp['profit']:.4f}")
+
+    if DRY_RUN:
+        state["trades"] += 1
+        state["total_profit"] += opp["profit"]
+        log(f"💰 DRY RUN - Total Profit: ${state['total_profit']:.4f}")
+    else:
+        # REAL TRADING (when ready)
+        log("⚠️ LIVE TRADING COMING SOON")
 
 # =========================
 # MAIN ENGINE
 # =========================
 async def engine():
     state["running"] = True
-    
-    balance = await update_balance()
-    log(f"💰 Balance: ${balance:.2f} USDT")
-    
-    log("🔍 Scanning for arbitrage opportunities...")
+    log("⚡ LOW LATENCY ENGINE STARTED")
+    log(f"💰 Trade Amount: ${TRADE_AMOUNT}")
+    log(f"🎯 Min Profit: {MIN_PROFIT}%")
+    log(f"🧪 DRY RUN: {DRY_RUN}")
     
     last_log = time.time()
     
     while not state["stop"]:
         try:
-            best = await scan_arbitrage()
-            
-            if best:
-                state["best"] = best
+            opp = scan_opportunity()
+
+            if opp:
+                state["best"] = opp
                 
-                if time.time() - last_log > 5:
-                    log(f"📊 Best: {best['pct']:.3f}% | {best['path']}")
+                if time.time() - last_log > 2:
+                    log(f"🔥 {opp['pct']:.3f}% | {opp['route']}")
                     last_log = time.time()
                 
-                if AUTO_TRADE and best["pct"] > MIN_PROFIT_PCT and best["profit"] > 0:
-                    await execute_trade(best)
-            
-            await asyncio.sleep(2)
-            
+                if opp["pct"] > MIN_PROFIT and opp["profit"] > 0:
+                    await execute_trade(opp)
+
+            await asyncio.sleep(0.05)  # 50ms - ULTRA FAST
+
         except Exception as e:
-            log(f"Engine error: {e}")
-            await asyncio.sleep(5)
+            log(f"ENGINE ERROR: {e}")
+            await asyncio.sleep(1)
     
-    await exchange.close()
     state["running"] = False
-    log("🛑 Engine stopped")
 
 # =========================
-# HTML DASHBOARD (embedded)
+# HTML DASHBOARD
 # =========================
-HTML_PAGE = """
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Arbitrage Bot</title>
+    <title>Ultra-Fast Arbitrage Bot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
-            background: #0a0c10; 
-            color: #e6edf3; 
-            padding: 20px;
-        }
-        .container { 
-            max-width: 900px; 
-            margin: 0 auto; 
-            background: #161b22; 
-            padding: 24px; 
-            border-radius: 16px; 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-        }
-        h1 { 
-            color: #58a6ff; 
-            font-size: 28px;
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .status { 
-            padding: 12px; 
-            border-radius: 8px; 
-            margin: 16px 0; 
-            font-weight: bold;
-            font-size: 16px;
-        }
-        .running { background: #0f5323; border-left: 4px solid #56d364; }
-        .stopped { background: #5a1e1e; border-left: 4px solid #f85149; }
-        .dry-run { background: #6e4600; border-left: 4px solid #f0883e; }
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 12px;
-            margin: 20px 0;
-        }
-        .stat-card {
-            background: #0d1117;
-            padding: 16px;
-            border-radius: 12px;
-            border: 1px solid #30363d;
-        }
-        .stat-label {
-            font-size: 12px;
-            color: #8b949e;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .stat-value {
-            font-size: 28px;
-            font-weight: bold;
-            margin-top: 8px;
-        }
-        .profit { color: #56d364; }
-        .loss { color: #f85149; }
-        .best-card {
-            background: #1f6feb;
-            padding: 16px;
-            border-radius: 12px;
-            margin: 20px 0;
-            text-align: center;
-        }
-        .best-path {
-            font-size: 20px;
-            font-weight: bold;
-            margin-bottom: 8px;
-        }
-        .best-profit {
-            font-size: 32px;
-            font-weight: bold;
-        }
-        button {
-            background: #238636;
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            margin: 8px;
-            cursor: pointer;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: bold;
-            transition: all 0.2s;
-        }
-        button:hover { background: #2ea043; transform: scale(1.02); }
-        .stop-btn { background: #da3633; }
-        .stop-btn:hover { background: #f85149; }
-        .logs {
-            background: #0d1117;
-            padding: 16px;
-            border-radius: 12px;
-            height: 350px;
-            overflow-y: auto;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            margin-top: 20px;
-            border: 1px solid #30363d;
-        }
-        .log-entry {
-            padding: 6px 0;
-            border-bottom: 1px solid #21262d;
-            font-family: monospace;
-        }
-        .refresh-btn {
-            background: #1f6feb;
-            font-size: 14px;
-            padding: 8px 16px;
-        }
-        .footer {
-            margin-top: 20px;
-            text-align: center;
-            font-size: 12px;
-            color: #8b949e;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-        .scanning {
-            animation: pulse 1.5s ease-in-out infinite;
-        }
+        body { font-family: 'Courier New', monospace; background: #0a0c10; color: #0f0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: #0d1117; padding: 20px; border: 1px solid #0f0; border-radius: 10px; }
+        .status { padding: 10px; border-radius: 5px; margin: 10px 0; text-align: center; font-weight: bold; }
+        .running { background: #0f5323; color: #0f0; }
+        .stopped { background: #5a1e1e; color: #f00; }
+        .dry { background: #6e4600; color: #ff0; }
+        .stat { margin: 10px 0; padding: 10px; background: #000; border-left: 3px solid #0f0; }
+        .profit { color: #0f0; }
+        .loss { color: #f00; }
+        button { background: #0f0; color: #000; border: none; padding: 10px 20px; margin: 5px; cursor: pointer; font-weight: bold; border-radius: 5px; }
+        button:hover { background: #0c0; }
+        .stop { background: #f00; color: #fff; }
+        .log { background: #000; padding: 10px; height: 400px; overflow-y: scroll; font-family: monospace; font-size: 11px; margin-top: 10px; border: 1px solid #333; }
+        .log-line { border-bottom: 1px solid #1a1a1a; padding: 4px 0; }
+        blink { animation: blink 1s step-end infinite; }
+        @keyframes blink { 50% { opacity: 0; } }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>
-            <span>🔄</span> 
-            Triangular Arbitrage Bot
-            <span id="scanIcon" style="font-size: 14px;"></span>
-        </h1>
+        <h1 style="text-align: center;">⚡ ULTRA-FAST ARBITRAGE BOT ⚡</h1>
+        <p style="text-align: center; color: #888;">50ms latency | WebSocket | Real-time</p>
         
-        <div id="statusDiv" class="status running">🟢 LOADING...</div>
+        <div id="status" class="status stopped">🔴 STOPPED</div>
+        <div class="dry" style="padding: 5px; text-align: center;">🧪 DRY RUN MODE - No real money</div>
         
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-label">💰 USDT Balance</div>
-                <div class="stat-value" id="balance">$0.00</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">📊 Total Trades</div>
-                <div class="stat-value" id="trades">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">✅ Wins / ❌ Losses</div>
-                <div class="stat-value" id="winsLosses">0 / 0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">💰 Total PnL</div>
-                <div class="stat-value" id="pnl">$0.00</div>
-            </div>
+        <div class="stat">💰 Balance: $<span id="balance">0.00</span></div>
+        <div class="stat">📊 Trades: <span id="trades">0</span></div>
+        <div class="stat">💰 Total PnL: $<span id="pnl">0.00</span></div>
+        
+        <div id="bestDiv" style="display: none; background: #0f0; color: #000; padding: 15px; margin: 10px 0; border-radius: 5px; text-align: center;">
+            <strong>🔥 LIVE OPPORTUNITY 🔥</strong><br>
+            <span id="bestRoute"></span><br>
+            <span id="bestPct" style="font-size: 24px; font-weight: bold;"></span>
         </div>
         
-        <div id="bestDiv" style="display: none;" class="best-card">
-            <div class="best-path" id="bestPath"></div>
-            <div class="best-profit" id="bestProfit"></div>
+        <div style="text-align: center;">
+            <button id="startBtn" onclick="startBot()">▶️ START BOT</button>
+            <button id="stopBtn" onclick="stopBot()" class="stop" style="display: none;">⏹️ STOP BOT</button>
         </div>
         
-        <div>
-            <button id="startBtn" onclick="startBot()">▶️ Start Bot</button>
-            <button id="stopBtn" onclick="stopBot()" class="stop-btn" style="display: none;">⏹️ Stop Bot</button>
-            <button onclick="refreshData()" class="refresh-btn">🔄 Refresh</button>
-        </div>
-        
-        <h3 style="margin-top: 20px;">📝 Live Logs</h3>
-        <div class="logs" id="logs">
-            <div class="log-entry">Waiting for bot to start...</div>
-        </div>
-        
-        <div class="footer">
-            ⚡ Scan every 2 seconds | Fee: 0.2% | DRY RUN MODE
+        <h3>📡 LIVE FEED (50ms updates)</h3>
+        <div class="log" id="logs">
+            <div class="log-line">Waiting for bot...</div>
         </div>
     </div>
 
     <script>
-        async function refreshData() {
+        async function refresh() {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 
-                // Update stats
-                document.getElementById('balance').innerHTML = `$${data.balance.toFixed(2)}`;
-                document.getElementById('trades').innerHTML = data.trades;
-                document.getElementById('winsLosses').innerHTML = `${data.wins} / ${data.losses}`;
+                document.getElementById('balance').innerText = data.balance?.toFixed(2) || '0.00';
+                document.getElementById('trades').innerText = data.trades || 0;
+                const pnl = data.total_profit || 0;
+                document.getElementById('pnl').innerHTML = pnl.toFixed(4);
+                document.getElementById('pnl').style.color = pnl >= 0 ? '#0f0' : '#f00';
                 
-                const pnlElem = document.getElementById('pnl');
-                pnlElem.innerHTML = `$${data.realized_pnl.toFixed(2)}`;
-                if (data.realized_pnl >= 0) {
-                    pnlElem.className = 'stat-value profit';
-                } else {
-                    pnlElem.className = 'stat-value loss';
-                }
-                
-                // Update status
-                const statusDiv = document.getElementById('statusDiv');
+                const statusDiv = document.getElementById('status');
                 if (data.running) {
-                    statusDiv.innerHTML = '🟢 RUNNING';
+                    statusDiv.innerHTML = '🟢 RUNNING (50ms loop)';
                     statusDiv.className = 'status running';
                     document.getElementById('startBtn').style.display = 'none';
                     document.getElementById('stopBtn').style.display = 'inline-block';
-                    document.getElementById('scanIcon').innerHTML = '⚡ scanning...';
-                    document.getElementById('scanIcon').className = 'scanning';
                 } else {
                     statusDiv.innerHTML = '🔴 STOPPED';
                     statusDiv.className = 'status stopped';
                     document.getElementById('startBtn').style.display = 'inline-block';
                     document.getElementById('stopBtn').style.display = 'none';
-                    document.getElementById('scanIcon').innerHTML = '';
                 }
                 
-                // Update best opportunity
-                if (data.best && data.best.pct) {
-                    const bestDiv = document.getElementById('bestDiv');
-                    bestDiv.style.display = 'block';
-                    document.getElementById('bestPath').innerHTML = data.best.path;
-                    const profitClass = data.best.profit >= 0 ? 'profit' : 'loss';
-                    document.getElementById('bestProfit').innerHTML = `${data.best.pct.toFixed(4)}% ($${data.best.profit.toFixed(4)})`;
-                    document.getElementById('bestProfit').className = `best-profit ${profitClass}`;
+                if (data.best && data.best.pct > 0) {
+                    document.getElementById('bestDiv').style.display = 'block';
+                    document.getElementById('bestRoute').innerHTML = data.best.route;
+                    document.getElementById('bestPct').innerHTML = `${data.best.pct.toFixed(4)}% ($${data.best.profit.toFixed(4)})`;
                 } else {
                     document.getElementById('bestDiv').style.display = 'none';
                 }
-            } catch(e) {
-                console.error(e);
-            }
+            } catch(e) {}
         }
         
         async function refreshLogs() {
@@ -483,32 +267,32 @@ HTML_PAGE = """
                 const res = await fetch('/api/logs');
                 const data = await res.json();
                 const logsDiv = document.getElementById('logs');
-                logsDiv.innerHTML = data.logs.map(log => `<div class="log-entry">${escapeHtml(log)}</div>`).join('');
-                logsDiv.scrollTop = logsDiv.scrollHeight;
-            } catch(e) {
-                console.error(e);
-            }
+                logsDiv.innerHTML = data.logs.map(l => `<div class="log-line">${escapeHtml(l)}</div>`).reverse().join('');
+            } catch(e) {}
         }
         
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+        function escapeHtml(t) {
+            return t.replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            });
         }
         
         async function startBot() {
             await fetch('/start');
-            setTimeout(() => refreshData(), 500);
+            setTimeout(refresh, 500);
         }
         
         async function stopBot() {
             await fetch('/stop');
-            setTimeout(() => refreshData(), 500);
+            setTimeout(refresh, 500);
         }
         
-        refreshData();
+        refresh();
         refreshLogs();
-        setInterval(refreshData, 3000);
+        setInterval(refresh, 1000);
         setInterval(refreshLogs, 2000);
     </script>
 </body>
@@ -516,25 +300,23 @@ HTML_PAGE = """
 """
 
 # =========================
-# FASTAPI ROUTES
+# FASTAPI ENDPOINTS
 # =========================
 @app.on_event("startup")
 async def startup():
-    log("🌐 Arbitrage Bot API Ready")
+    log("🌐 WebSocket Arbitrage Bot Ready")
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(content=HTML_PAGE)
+    return HTMLResponse(content=HTML)
 
 @app.get("/api/status")
 async def get_status():
     return {
         "running": state["running"],
-        "balance": state["balance"],
+        "balance": 0,  # Add balance fetch if needed
         "trades": state["trades"],
-        "wins": state["wins"],
-        "losses": state["losses"],
-        "realized_pnl": state["realized_pnl"],
+        "total_profit": state["total_profit"],
         "best": state["best"]
     }
 
@@ -546,9 +328,8 @@ async def get_logs():
 async def start_bot():
     if state["running"]:
         return {"status": "already_running"}
-    
     state["stop"] = False
-    asyncio.create_task(engine())
+    asyncio.create_task(run_bot())
     return {"status": "started"}
 
 @app.get("/stop")
@@ -556,9 +337,13 @@ async def stop_bot():
     state["stop"] = True
     return {"status": "stopping"}
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "running": state["running"]}
+async def run_bot():
+    await asyncio.gather(
+        stream("BTC/USDT"),
+        stream("ETH/USDT"),
+        stream("ETH/BTC"),
+        engine()
+    )
 
 # =========================
 # RUN
