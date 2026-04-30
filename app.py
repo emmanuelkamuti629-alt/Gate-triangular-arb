@@ -56,108 +56,156 @@ async def init():
 # PRICE FETCH (BID/ASK)
 # =========================
 async def get_ticker(symbol):
-    t = await exchange.fetch_ticker(symbol)
-    return {
-        "bid": t.get("bid") or t.get("last") or 0,
-        "ask": t.get("ask") or t.get("last") or 0
-    }
-
-# =========================
-# REAL TRIANGLE SIMULATION
-# =========================
-def apply_trade(asset, amount, price, side):
-    if side == "buy":
-        base = amount / price
-        return base * (1 - FEE), None
-    else:
-        quote = amount * price
-        return quote * (1 - FEE), None
-
-async def simulate_triangle(path):
-    asset = "USDT"
-    amount = TRADE_AMOUNT
-
-    for step in path:
-        symbol = step["symbol"]
-        side = step["side"]
-
-        ticker = state["prices"].get(symbol)
-        if not ticker:
-            return None
-
-        price = ticker["ask"] if side == "buy" else ticker["bid"]
-
-        if price <= 0:
-            return None
-
-        amount, _ = apply_trade(asset, amount, price, side)
-
-        # asset changes logically
-        asset = step["to"]
-
-    profit = amount - TRADE_AMOUNT
-    pct = (profit / TRADE_AMOUNT) * 100
-
-    if pct >= MIN_PROFIT:
+    try:
+        t = await exchange.fetch_ticker(symbol)
         return {
-            "route": path,
-            "profit": profit,
-            "pct": pct
+            "bid": t.get("bid") or t.get("last") or 0,
+            "ask": t.get("ask") or t.get("last") or 0
         }
-
-    return None
+    except Exception as e:
+        log(f"Error fetching {symbol}: {e}")
+        return {"bid": 0, "ask": 0}
 
 # =========================
-# TRIANGLES (FIXED)
+# REAL TRIANGLE SIMULATION (FIXED)
+# =========================
+async def simulate_triangle(triangle):
+    """Calculate profit for a triangle path"""
+    try:
+        amount = TRADE_AMOUNT
+        
+        for step in triangle["path"]:
+            symbol = step["symbol"]
+            side = step["side"]
+            
+            ticker = state["prices"].get(symbol)
+            if not ticker:
+                ticker = await get_ticker(symbol)
+                state["prices"][symbol] = ticker
+            
+            price = ticker["ask"] if side == "buy" else ticker["bid"]
+            
+            if price <= 0:
+                return None
+            
+            if side == "buy":
+                # Buy: USDT -> Crypto
+                amount = (amount / price) * (1 - FEE)
+            else:
+                # Sell: Crypto -> USDT
+                amount = (amount * price) * (1 - FEE)
+        
+        profit = amount - TRADE_AMOUNT
+        pct = (profit / TRADE_AMOUNT) * 100
+        
+        if pct >= MIN_PROFIT and profit > 0:
+            return {
+                "route": triangle["name"],
+                "profit": profit,
+                "pct": pct,
+                "path": " → ".join([step["symbol"] for step in triangle["path"]])
+            }
+        return None
+        
+    except Exception as e:
+        log(f"Simulation error for {triangle['name']}: {e}")
+        return None
+
+# =========================
+# TRIANGLES (COMPLETE)
 # =========================
 TRIANGLES = [
     {
         "name": "USDT → BTC → ETH → USDT",
         "path": [
-            {"symbol": "BTC/USDT", "side": "buy", "to": "BTC"},
-            {"symbol": "ETH/BTC", "side": "buy", "to": "ETH"},
-            {"symbol": "ETH/USDT", "side": "sell", "to": "USDT"},
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "ETH/BTC", "side": "buy"},
+            {"symbol": "ETH/USDT", "side": "sell"},
         ]
     },
     {
         "name": "USDT → BTC → BNB → USDT",
         "path": [
-            {"symbol": "BTC/USDT", "side": "buy", "to": "BTC"},
-            {"symbol": "BNB/BTC", "side": "buy", "to": "BNB"},
-            {"symbol": "BNB/USDT", "side": "sell", "to": "USDT"},
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "BNB/BTC", "side": "buy"},
+            {"symbol": "BNB/USDT", "side": "sell"},
         ]
     },
     {
         "name": "USDT → BTC → XRP → USDT",
         "path": [
-            {"symbol": "BTC/USDT", "side": "buy", "to": "BTC"},
-            {"symbol": "XRP/BTC", "side": "buy", "to": "XRP"},
-            {"symbol": "XRP/USDT", "side": "sell", "to": "USDT"},
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "XRP/BTC", "side": "buy"},
+            {"symbol": "XRP/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → LTC → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "LTC/BTC", "side": "buy"},
+            {"symbol": "LTC/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → ADA → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "ADA/BTC", "side": "buy"},
+            {"symbol": "ADA/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → DOGE → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "DOGE/BTC", "side": "buy"},
+            {"symbol": "DOGE/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → SOL → USDT (Simple)",
+        "path": [
+            {"symbol": "SOL/USDT", "side": "buy"},
+            {"symbol": "SOL/USDT", "side": "sell"},
         ]
     }
 ]
 
 # =========================
+# UPDATE ALL PRICES
+# =========================
+async def update_all_prices():
+    """Fetch all needed prices in parallel"""
+    all_symbols = set()
+    for triangle in TRIANGLES:
+        for step in triangle["path"]:
+            all_symbols.add(step["symbol"])
+    
+    # Fetch all tickers in parallel
+    tasks = [get_ticker(symbol) for symbol in all_symbols]
+    results = await asyncio.gather(*tasks)
+    
+    for symbol, ticker in zip(all_symbols, results):
+        state["prices"][symbol] = ticker
+
+# =========================
 # SCAN LOOP
 # =========================
 async def scan():
+    """Scan all triangles for opportunities"""
     opportunities = []
-
-    try:
-        for t in TRIANGLES:
-            # update prices for symbols used
-            symbols = {step["symbol"] for step in t["path"]}
-            for s in symbols:
-                state["prices"][s] = await get_ticker(s)
-
-            result = await simulate_triangle(t["path"])
-            if result:
-                result["route"] = t["name"]
-                opportunities.append(result)
-
-    except Exception as e:
-        log(f"Scan error: {e}")
-
+    
+    # Update all prices first
+    await update_all_prices()
+    
+    # Calculate each triangle
+    for triangle in TRIANGLES:
+        result = await simulate_triangle(triangle)
+        if result:
+            opportunities.append(result)
+    
+    # Sort by profit percentage
     opportunities.sort(key=lambda x: x["pct"], reverse=True)
     return opportunities
 
@@ -166,29 +214,168 @@ async def scan():
 # =========================
 async def engine():
     state["running"] = True
-    log("🚀 Bot started")
-
+    log("🚀 MULTI-TRIANGLE ARBITRAGE BOT STARTED")
+    log(f"💰 Trade Amount: ${TRADE_AMOUNT}")
+    log(f"🎯 Min Profit: {MIN_PROFIT}%")
+    log(f"🧪 Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
+    log(f"🔺 Scanning {len(TRIANGLES)} triangles")
+    
     while not state["stop"]:
-        ops = await scan()
-
-        state["all_opportunities"] = ops[:10]
-        state["best"] = ops[0] if ops else None
-
-        if state["best"]:
-            log(f"🎯 {state['best']['route']} | {state['best']['pct']:.4f}%")
-
-            if DRY_RUN:
-                state["trades"] += 1
-                state["total_profit"] += state["best"]["profit"]
-
-        await asyncio.sleep(2)
+        try:
+            ops = await scan()
+            
+            state["all_opportunities"] = ops[:10]
+            state["best"] = ops[0] if ops else None
+            
+            if state["best"] and state["best"]["pct"] > MIN_PROFIT:
+                best = state["best"]
+                log(f"🎯 {best['route']} | {best['pct']:.4f}% | ${best['profit']:.4f}")
+                
+                if DRY_RUN:
+                    state["trades"] += 1
+                    state["total_profit"] += best["profit"]
+                    log(f"💰 [DRY RUN] Total: ${state['total_profit']:.4f}")
+            
+            await asyncio.sleep(2)  # Scan every 2 seconds
+            
+        except Exception as e:
+            log(f"Engine error: {e}")
+            await asyncio.sleep(2)
 
 # =========================
-# API
+# DASHBOARD HTML
+# =========================
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Arbitrage Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Courier New', monospace; background: #0a0c10; color: #0f0; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        h1 { text-align: center; border-bottom: 1px solid #0f0; padding-bottom: 10px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
+        .card { background: #0d1117; border: 1px solid #0f0; border-radius: 8px; padding: 15px; text-align: center; }
+        .card-value { font-size: 24px; font-weight: bold; margin-top: 5px; }
+        .section { margin-bottom: 20px; }
+        .section-title { font-size: 18px; border-left: 3px solid #0f0; padding-left: 10px; margin-bottom: 10px; }
+        .opportunity { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+        .opportunity-best { border-color: #ff0; background: #1a1a00; }
+        .profit-pct { font-size: 20px; font-weight: bold; color: #0f0; }
+        .profit-usd { font-size: 14px; color: #0f0; }
+        .market-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
+        .market-card { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 10px; text-align: center; }
+        .logs { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 10px; height: 300px; overflow-y: auto; font-size: 11px; }
+        .log-line { border-bottom: 1px solid #1a1a1a; padding: 4px 0; }
+        button { background: #0f0; color: #000; border: none; padding: 10px 20px; margin: 5px; cursor: pointer; font-weight: bold; border-radius: 5px; font-size: 16px; }
+        button:hover { background: #0c0; }
+        .stop-btn { background: #f00; color: #fff; }
+        .footer { text-align: center; font-size: 10px; color: #444; margin-top: 20px; padding-top: 10px; border-top: 1px solid #333; }
+        .running { color: #0f0; }
+        .stopped { color: #f00; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚡ TRIANGULAR ARBITRAGE BOT ⚡</h1>
+        
+        <div id="stats" class="stats"></div>
+        
+        <div class="section">
+            <div class="section-title">🏆 BEST OPPORTUNITY</div>
+            <div id="best"></div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">🔥 ALL PROFITABLE OPPORTUNITIES</div>
+            <div id="opportunities"></div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">📊 LIVE MARKET PRICES</div>
+            <div id="prices" class="market-grid"></div>
+        </div>
+        
+        <div class="section">
+            <div class="section-title">📝 LIVE LOGS</div>
+            <div id="logs" class="logs"></div>
+        </div>
+        
+        <div style="text-align: center;">
+            <button onclick="startBot()">▶ START BOT</button>
+            <button onclick="stopBot()" class="stop-btn">⏹ STOP BOT</button>
+            <button onclick="refresh()">🔄 REFRESH</button>
+        </div>
+        
+        <div class="footer">
+            💰 Trade: $""" + str(TRADE_AMOUNT) + """ | 🎯 Min Profit: """ + str(MIN_PROFIT) + """% | 💸 Fee: 0.2% | Mode: """ + ("DRY RUN" if DRY_RUN else "LIVE") + """
+        </div>
+    </div>
+    
+    <script>
+        async function refresh() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                const balance = await fetch('/api/balance').then(r => r.json());
+                
+                document.getElementById('stats').innerHTML = `
+                    <div class="card"><div>💰 USDT BALANCE</div><div class="card-value">$${balance.usdt?.toFixed(2) || '0'}</div></div>
+                    <div class="card"><div>📊 TOTAL P&L</div><div class="card-value ${data.total_profit >= 0 ? 'profit-pct' : ''}">$${data.total_profit.toFixed(4)}</div></div>
+                    <div class="card"><div>🎯 TRADES</div><div class="card-value">${data.trades}</div></div>
+                    <div class="card"><div>⚡ STATUS</div><div class="card-value ${data.running ? 'running' : 'stopped'}">${data.running ? 'RUNNING' : 'STOPPED'}</div></div>
+                `;
+                
+                if (data.best && data.best.pct > 0) {
+                    document.getElementById('best').innerHTML = `<div class="opportunity opportunity-best"><strong>${data.best.route}</strong><br><span class="profit-pct">${data.best.pct.toFixed(4)}%</span> <span class="profit-usd">($${data.best.profit.toFixed(4)})</span></div>`;
+                } else {
+                    document.getElementById('best').innerHTML = '<div class="opportunity">🔍 Waiting for opportunities...</div>';
+                }
+                
+                if (data.all_opportunities && data.all_opportunities.length > 0) {
+                    document.getElementById('opportunities').innerHTML = data.all_opportunities.map(o => `
+                        <div class="opportunity">
+                            <strong>${o.route}</strong><br>
+                            <span class="profit-pct">${o.pct.toFixed(4)}%</span> <span class="profit-usd">($${o.profit.toFixed(4)})</span>
+                        </div>
+                    `).join('');
+                } else {
+                    document.getElementById('opportunities').innerHTML = '<div class="opportunity">🔍 No profitable opportunities found...</div>';
+                }
+                
+                const prices = await fetch('/api/prices').then(r => r.json());
+                const priceKeys = Object.keys(prices).slice(0, 8);
+                document.getElementById('prices').innerHTML = priceKeys.map(k => `<div class="market-card"><strong>${k}</strong><br>$${prices[k].toFixed(2)}</div>`).join('');
+                
+                const logs = await fetch('/api/logs').then(r => r.json());
+                document.getElementById('logs').innerHTML = logs.logs.slice().reverse().slice(0, 40).map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
+            } catch(e) { console.error(e); }
+        }
+        
+        function escapeHtml(t) { if (!t) return ''; return t.replace(/[&<>]/g, m => m === '&' ? '&amp;' : m === '<' ? '&lt;' : '&gt;'); }
+        
+        async function startBot() { await fetch('/start'); setTimeout(refresh, 1000); }
+        async function stopBot() { await fetch('/stop'); setTimeout(refresh, 1000); }
+        
+        setInterval(refresh, 2000);
+        refresh();
+    </script>
+</body>
+</html>
+"""
+
+# =========================
+# API ENDPOINTS
 # =========================
 @app.on_event("startup")
 async def startup():
     await init()
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTML
 
 @app.get("/start")
 async def start():
@@ -200,18 +387,38 @@ async def start():
 @app.get("/stop")
 async def stop():
     state["stop"] = True
+    state["running"] = False
     return {"status": "stopped"}
 
 @app.get("/api/status")
 async def status():
-    return state
+    return {
+        "running": state["running"],
+        "trades": state["trades"],
+        "total_profit": state["total_profit"],
+        "best": state["best"],
+        "all_opportunities": state["all_opportunities"]
+    }
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return "<h2>Arbitrage Bot Running (Fixed Version)</h2>"
+@app.get("/api/logs")
+async def get_logs():
+    return {"logs": state["logs"]}
+
+@app.get("/api/balance")
+async def get_balance():
+    try:
+        balance = await exchange.fetch_balance()
+        return {"usdt": balance.get("USDT", {}).get("free", 0)}
+    except:
+        return {"usdt": 0}
+
+@app.get("/api/prices")
+async def get_prices():
+    return {k: round(v.get("bid", 0), 2) for k, v in state["prices"].items() if v.get("bid", 0) > 0}
 
 # =========================
 # RUN
 # =========================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
