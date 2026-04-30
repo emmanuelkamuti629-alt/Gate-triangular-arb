@@ -1,26 +1,93 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Gate.io Arb Bot</title>
-    <meta http-equiv="refresh" content="5">
+    <title>Triangular Arbitrage Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
-       .stat { margin: 10px 0; }
-       .logs { background: #000; padding: 10px; height: 400px; overflow-y: scroll; }
+        body { 
+            font-family: 'Segoe UI', Arial, sans-serif; 
+            margin: 20px; 
+            background: #0d1117; 
+            color: #c9d1d9;
+        }
+        .container { 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background: #161b22; 
+            padding: 20px; 
+            border-radius: 10px; 
+        }
+        h1 { color: #58a6ff; }
+        h3 { color: #58a6ff; margin-top: 20px; }
+        .status { 
+            padding: 10px; 
+            border-radius: 5px; 
+            margin: 10px 0; 
+            font-weight: bold;
+        }
+        .running { background: #0f5323; color: #fff; }
+        .stopped { background: #da3633; color: #fff; }
+        .log { 
+            background: #0d1117; 
+            padding: 10px; 
+            border-radius: 5px; 
+            font-family: 'Courier New', monospace; 
+            font-size: 12px;
+            height: 400px; 
+            overflow-y: scroll; 
+        }
+        .stat { 
+            margin: 10px 0; 
+            padding: 8px;
+            background: #0d1117;
+            border-radius: 5px;
+        }
+        button { 
+            background: #238636; 
+            color: white; 
+            border: none; 
+            padding: 10px 20px; 
+            border-radius: 5px; 
+            cursor: pointer; 
+            font-size: 16px;
+            margin: 10px 0;
+        }
+        button:hover { background: #2ea043; }
+        .log-entry { 
+            border-bottom: 1px solid #21262d; 
+            padding: 5px 0;
+            font-family: monospace;
+        }
+        .warning { color: #f0883e; }
+        .error { color: #f85149; }
+        .success { color: #56d364; }
     </style>
 </head>
 <body>
-    <h1>Gate.io Triangular Arb Bot</h1>
-    <div class="stat">Status: {{ 'RUNNING' if status.running else 'STOPPED' }}</div>
-    <div class="stat">Last Run: {{ status.last_run }}</div>
-    <div class="stat">Total Trades: {{ status.total_trades }}</div>
-    <div class="stat">Total PnL: {{ status.total_pnl:.4f }} USDT</div>
-    <div class="stat">Last Profit: {{ status.last_profit:.4f }} USDT</div>
-    <h3>Logs:</h3>
-    <div class="logs">
-        {% for log in status.logs[::-1] %}
-        <div>{{ log }}</div>
-        {% endfor %}
+    <div class="container">
+        <h1>🔄 Triangular Arbitrage Bot</h1>
+        
+        <div class="status {% if status.running %}running{% else %}stopped{% endif %}">
+            {% if status.running %}🟢 RUNNING{% else %}🔴 STOPPED{% endif %}
+        </div>
+        
+        <div class="stat"><strong>Last Run:</strong> {{ status.last_run or 'Never' }}</div>
+        <div class="stat"><strong>Last Profit:</strong> {{ "%.4f"|format(status.last_profit) }}%</div>
+        <div class="stat"><strong>Total Trades:</strong> {{ status.total_trades }}</div>
+        <div class="stat"><strong>Successful Trades:</strong> {{ status.successful_trades }}</div>
+        <div class="stat"><strong>Failed Trades:</strong> {{ status.failed_trades }}</div>
+        <div class="stat"><strong>Total PnL:</strong> ${{ "%.2f"|format(status.total_pnl) }}</div>
+        
+        {% if status.running %}
+        <a href="/stop"><button>⏹️ Stop Bot</button></a>
+        {% endif %}
+        
+        <h3>📝 Live Logs</h3>
+        <div class="log">
+            {% for log in status.logs|reverse %}
+            <div class="log-entry">{{ log }}</div>
+            {% endfor %}
+        </div>
     </div>
 </body>
 </html>
