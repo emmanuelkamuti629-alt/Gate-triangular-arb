@@ -112,9 +112,10 @@ async def simulate_triangle(triangle):
         return None
 
 # =========================
-# TRIANGLES (COMPLETE)
+# TRIANGLES (COMPLETE WITH ALL ADDITIONS)
 # =========================
 TRIANGLES = [
+    # Original triangles
     {
         "name": "USDT → BTC → ETH → USDT",
         "path": [
@@ -168,6 +169,88 @@ TRIANGLES = [
         "path": [
             {"symbol": "SOL/USDT", "side": "buy"},
             {"symbol": "SOL/USDT", "side": "sell"},
+        ]
+    },
+    
+    # NEW TRIANGLES ADDED
+    {
+        "name": "USDT → BTC → SOL → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "SOL/BTC", "side": "buy"},
+            {"symbol": "SOL/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → ETH → LINK → USDT",
+        "path": [
+            {"symbol": "ETH/USDT", "side": "buy"},
+            {"symbol": "LINK/ETH", "side": "buy"},
+            {"symbol": "LINK/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → ETH → MATIC → USDT",
+        "path": [
+            {"symbol": "ETH/USDT", "side": "buy"},
+            {"symbol": "MATIC/ETH", "side": "buy"},
+            {"symbol": "MATIC/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → XRP → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "XRP/BTC", "side": "buy"},
+            {"symbol": "XRP/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → AVAX → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "AVAX/BTC", "side": "buy"},
+            {"symbol": "AVAX/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → ETH → ADA → USDT",
+        "path": [
+            {"symbol": "ETH/USDT", "side": "buy"},
+            {"symbol": "ADA/ETH", "side": "buy"},
+            {"symbol": "ADA/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BNB → DOGE → USDT",
+        "path": [
+            {"symbol": "BNB/USDT", "side": "buy"},
+            {"symbol": "DOGE/BNB", "side": "buy"},
+            {"symbol": "DOGE/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → INJ → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "INJ/BTC", "side": "buy"},
+            {"symbol": "INJ/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → ETH → OP → USDT",
+        "path": [
+            {"symbol": "ETH/USDT", "side": "buy"},
+            {"symbol": "OP/ETH", "side": "buy"},
+            {"symbol": "OP/USDT", "side": "sell"},
+        ]
+    },
+    {
+        "name": "USDT → BTC → PEPE → USDT",
+        "path": [
+            {"symbol": "BTC/USDT", "side": "buy"},
+            {"symbol": "PEPE/BTC", "side": "buy"},
+            {"symbol": "PEPE/USDT", "side": "sell"},
         ]
     }
 ]
