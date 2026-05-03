@@ -1,507 +1,373 @@
-import asyncio
 import os
+import asyncio
+import logging
+import threading
 import time
-from dotenv import load_dotenv
+from datetime import datetime
+from collections import defaultdict
+from flask import Flask, render_template_string, jsonify
 import ccxt.async_support as ccxt
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-import uvicorn
+from aiolimiter import AsyncLimiter
+from dotenv import load_dotenv
 
-# =========================
-# CONFIG
-# =========================
 load_dotenv()
-app = FastAPI()
 
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "20"))
-MIN_PROFIT = float(os.getenv("MIN_PROFIT_PCT", "0.05"))
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-FEE = 0.002
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
-exchange = ccxt.gateio({
-    "apiKey": os.getenv("GATEIO_API_KEY"),
-    "secret": os.getenv("GATEIO_SECRET"),
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"},
-})
+# === CONFIG ===
+EXCHANGE_IDS = ['mexc', 'kucoin', 'gate', 'bitget', 'coinex']
+MIN_SPREAD = 0.4
+MIN_TRADE_USD = 50
+MAX_TRADE_USD = 2000
+TRADE_SIZES = [50, 100, 500, 1000, 2000]
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+MAX_WS_TOTAL = 500
+ORDERBOOK_DEPTH = 20
+STALE_BOOK_MS = 3000
+OPP_EXPIRE_MS = 60000
 
-# =========================
-# STATE
-# =========================
-state = {
-    "running": False,
-    "stop": False,
-    "logs": [],
-    "best": None,
-    "all_opportunities": [],
-    "trades": 0,
-    "total_profit": 0.0,
-    "prices": {}
-}
-
-def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line)
-    state["logs"].append(line)
-    state["logs"] = state["logs"][-100:]
-
-# =========================
-# INIT MARKETS
-# =========================
-async def init():
-    await exchange.load_markets()
-    log("📡 Markets loaded")
-
-# =========================
-# PRICE FETCH (BID/ASK)
-# =========================
-async def get_ticker(symbol):
-    try:
-        t = await exchange.fetch_ticker(symbol)
-        return {
-            "bid": t.get("bid") or t.get("last") or 0,
-            "ask": t.get("ask") or t.get("last") or 0
-        }
-    except Exception as e:
-        log(f"Error fetching {symbol}: {e}")
-        return {"bid": 0, "ask": 0}
-
-# =========================
-# REAL TRIANGLE SIMULATION (FIXED)
-# =========================
-async def simulate_triangle(triangle):
-    """Calculate profit for a triangle path"""
-    try:
-        amount = TRADE_AMOUNT
-        
-        for step in triangle["path"]:
-            symbol = step["symbol"]
-            side = step["side"]
-            
-            ticker = state["prices"].get(symbol)
-            if not ticker:
-                ticker = await get_ticker(symbol)
-                state["prices"][symbol] = ticker
-            
-            price = ticker["ask"] if side == "buy" else ticker["bid"]
-            
-            if price <= 0:
-                return None
-            
-            if side == "buy":
-                # Buy: USDT -> Crypto
-                amount = (amount / price) * (1 - FEE)
-            else:
-                # Sell: Crypto -> USDT
-                amount = (amount * price) * (1 - FEE)
-        
-        profit = amount - TRADE_AMOUNT
-        pct = (profit / TRADE_AMOUNT) * 100
-        
-        if pct >= MIN_PROFIT and profit > 0:
-            return {
-                "route": triangle["name"],
-                "profit": profit,
-                "pct": pct,
-                "path": " → ".join([step["symbol"] for step in triangle["path"]])
-            }
-        return None
-        
-    except Exception as e:
-        log(f"Simulation error for {triangle['name']}: {e}")
-        return None
-
-# =========================
-# TRIANGLES (COMPLETE WITH ALL ADDITIONS)
-# =========================
-TRIANGLES = [
-    # Original triangles
-    {
-        "name": "USDT → BTC → ETH → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "ETH/BTC", "side": "buy"},
-            {"symbol": "ETH/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → BNB → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "BNB/BTC", "side": "buy"},
-            {"symbol": "BNB/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → XRP → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "XRP/BTC", "side": "buy"},
-            {"symbol": "XRP/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → LTC → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "LTC/BTC", "side": "buy"},
-            {"symbol": "LTC/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → ADA → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "ADA/BTC", "side": "buy"},
-            {"symbol": "ADA/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → DOGE → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "DOGE/BTC", "side": "buy"},
-            {"symbol": "DOGE/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → SOL → USDT (Simple)",
-        "path": [
-            {"symbol": "SOL/USDT", "side": "buy"},
-            {"symbol": "SOL/USDT", "side": "sell"},
-        ]
-    },
-    
-    # NEW TRIANGLES ADDED
-    {
-        "name": "USDT → BTC → SOL → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "SOL/BTC", "side": "buy"},
-            {"symbol": "SOL/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → ETH → LINK → USDT",
-        "path": [
-            {"symbol": "ETH/USDT", "side": "buy"},
-            {"symbol": "LINK/ETH", "side": "buy"},
-            {"symbol": "LINK/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → ETH → MATIC → USDT",
-        "path": [
-            {"symbol": "ETH/USDT", "side": "buy"},
-            {"symbol": "MATIC/ETH", "side": "buy"},
-            {"symbol": "MATIC/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → XRP → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "XRP/BTC", "side": "buy"},
-            {"symbol": "XRP/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → AVAX → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "AVAX/BTC", "side": "buy"},
-            {"symbol": "AVAX/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → ETH → ADA → USDT",
-        "path": [
-            {"symbol": "ETH/USDT", "side": "buy"},
-            {"symbol": "ADA/ETH", "side": "buy"},
-            {"symbol": "ADA/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BNB → DOGE → USDT",
-        "path": [
-            {"symbol": "BNB/USDT", "side": "buy"},
-            {"symbol": "DOGE/BNB", "side": "buy"},
-            {"symbol": "DOGE/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → INJ → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "INJ/BTC", "side": "buy"},
-            {"symbol": "INJ/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → ETH → OP → USDT",
-        "path": [
-            {"symbol": "ETH/USDT", "side": "buy"},
-            {"symbol": "OP/ETH", "side": "buy"},
-            {"symbol": "OP/USDT", "side": "sell"},
-        ]
-    },
-    {
-        "name": "USDT → BTC → PEPE → USDT",
-        "path": [
-            {"symbol": "BTC/USDT", "side": "buy"},
-            {"symbol": "PEPE/BTC", "side": "buy"},
-            {"symbol": "PEPE/USDT", "side": "sell"},
-        ]
-    }
+# === YOUR 280 COINS ===
+COINS = [
+'BTC','ETH','BNB','SOL','TON','SUI','XLM','XMR','DOGE','AVAX','TRX','ADA','MATIC','POL','LINK','DOT','XRP','ICP','HBAR','SHIB',
+'LTC','ETC','BCH','NEAR','APT','ARB','OP','INJ','RUNE','FET','GRT','UNI','AAVE','MKR','SNX','CRV','SUSHI','1INCH','COMP','YFI','BAL','GMX','WOO',
+'IMX','AR','EGLD','FLUX','ALGO','KCS','ZEC','STX','VET','FIL','RNDR','ROSE','STG','RLB','RDNT','JUP','PYR','JTO','WLD','ZRO','TIA','SEI',
+'AGIX','AKT','MINA','FLOW','ZIL','QTUM','ENJ','CHZ','BAT','MANA','SAND','GALA','AXS','ILV','YGG','DYDX','LDO','PENDLE','JOE','CELR','IOTX','CKB',
+'XVS','XEM','DGB','RVN','SC','NKN','SYS','RLC','OMG','ZRX','BAND','OXT','CTSI','PERP','RIF','LRC','SKL','CVC','WAXP','BNT','REN','UMA','NMR','TRU',
+'IDEX','HFT','BIGTIME','FLM','ALPHA','TLM','OGN','CHR','REEF','POLYX','DAR','LPT','MX','HOT','ANKR','UTK','API3','CELO','KDA','GLMR','MOVR','SXP','KAVA',
+'OKB','GT','HT','LEO','KLAY','XTZ','ATOM','KSM','WAVES','IOTA','NEO','ONT','NANO','DASH','XEC','THETA','TFUEL','FTM','CFX','STRK','METIS',
+'PEPE','BONK','WIF','POPCAT','MEW','BOME','MOG','NEIRO','BRETT','FLOKI','TURBO','WEN','SLERF','PNUT','TRUMP','MELANIA','BABYDOGE','DOGWIFHAT','TOSHI','PURR','NYAN','CAT','MASK',
+'STMX','BICO','ACH','LINA','HARD','IRIS','LTO','MDX','NULS','PHA','QNT','KNC','DODO','BEL','PERL','DATA','SFP','LIT','TORN','ARPA','GTC',
+'CTK','COS','DUSK','FIS','FORTH','FXS','MAGIC','RAD','ALICE','SLP','GMT','GST','VOXEL','XETA','HOOK','ID','ASTR','RPL','SD','LQTY','POND',
+'PEOPLE','WOJAK','MILADY','DOGS','CATE','ELON','SHIB2','PEPE2','MOON','STAR','AIDOGE','BULL','BEAR','FLOKICEO','CHEEMS','KISHU','HOGE','AKITA','SAFEMOON'
 ]
 
-# =========================
-# UPDATE ALL PRICES
-# =========================
-async def update_all_prices():
-    """Fetch all needed prices in parallel"""
-    all_symbols = set()
-    for triangle in TRIANGLES:
-        for step in triangle["path"]:
-            all_symbols.add(step["symbol"])
-    
-    # Fetch all tickers in parallel
-    tasks = [get_ticker(symbol) for symbol in all_symbols]
-    results = await asyncio.gather(*tasks)
-    
-    for symbol, ticker in zip(all_symbols, results):
-        state["prices"][symbol] = ticker
+PAIRS = list(set([f"{coin}/USDT" for coin in COINS if coin]))
+logger.info(f"Loaded {len(PAIRS)} unique USDT pairs")
 
-# =========================
-# SCAN LOOP
-# =========================
-async def scan():
-    """Scan all triangles for opportunities"""
-    opportunities = []
-    
-    # Update all prices first
-    await update_all_prices()
-    
-    # Calculate each triangle
-    for triangle in TRIANGLES:
-        result = await simulate_triangle(triangle)
-        if result:
-            opportunities.append(result)
-    
-    # Sort by profit percentage
-    opportunities.sort(key=lambda x: x["pct"], reverse=True)
-    return opportunities
+FEES = {
+    'mexc': {'taker': 0.002, 'maker': 0.0},
+    'kucoin': {'taker': 0.001, 'maker': 0.001},
+    'coinex': {'taker': 0.002, 'maker': 0.002},
+    'gate': {'taker': 0.0015, 'maker': 0.0015},
+    'bitget': {'taker': 0.001, 'maker': 0.001}
+}
 
-# =========================
-# ENGINE
-# =========================
-async def engine():
-    state["running"] = True
-    log("🚀 MULTI-TRIANGLE ARBITRAGE BOT STARTED")
-    log(f"💰 Trade Amount: ${TRADE_AMOUNT}")
-    log(f"🎯 Min Profit: {MIN_PROFIT}%")
-    log(f"🧪 Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
-    log(f"🔺 Scanning {len(TRIANGLES)} triangles")
-    
-    while not state["stop"]:
-        try:
-            ops = await scan()
-            
-            state["all_opportunities"] = ops[:10]
-            state["best"] = ops[0] if ops else None
-            
-            if state["best"] and state["best"]["pct"] > MIN_PROFIT:
-                best = state["best"]
-                log(f"🎯 {best['route']} | {best['pct']:.4f}% | ${best['profit']:.4f}")
-                
-                if DRY_RUN:
-                    state["trades"] += 1
-                    state["total_profit"] += best["profit"]
-                    log(f"💰 [DRY RUN] Total: ${state['total_profit']:.4f}")
-            
-            await asyncio.sleep(2)  # Scan every 2 seconds
-            
-        except Exception as e:
-            log(f"Engine error: {e}")
-            await asyncio.sleep(2)
+class ArbitrageState:
+    def __init__(self):
+        self.exchanges = {}
+        self.orderbooks = defaultdict(lambda: defaultdict(dict))
+        self.opportunities = []
+        self.last_update = None
+        self.active_pairs = []
+        self.rate_limiters = {
+            'mexc': AsyncLimiter(18, 1), 'kucoin': AsyncLimiter(9, 1),
+            'coinex': AsyncLimiter(9, 1), 'gate': AsyncLimiter(2, 1),
+            'bitget': AsyncLimiter(9, 1),
+        }
+        self.alerted_opps = {}
+        self.ws_tasks = {}
+        self.pair_availability = defaultdict(set)
+        self.currencies = {}
 
-# =========================
-# DASHBOARD HTML
-# =========================
-HTML = """
+state = ArbitrageState()
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Arbitrage Bot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Arbitrage Scanner</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Courier New', monospace; background: #0a0c10; color: #0f0; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        h1 { text-align: center; border-bottom: 1px solid #0f0; padding-bottom: 10px; margin-bottom: 20px; }
-        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }
-        .card { background: #0d1117; border: 1px solid #0f0; border-radius: 8px; padding: 15px; text-align: center; }
-        .card-value { font-size: 24px; font-weight: bold; margin-top: 5px; }
-        .section { margin-bottom: 20px; }
-        .section-title { font-size: 18px; border-left: 3px solid #0f0; padding-left: 10px; margin-bottom: 10px; }
-        .opportunity { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
-        .opportunity-best { border-color: #ff0; background: #1a1a00; }
-        .profit-pct { font-size: 20px; font-weight: bold; color: #0f0; }
-        .profit-usd { font-size: 14px; color: #0f0; }
-        .market-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
-        .market-card { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 10px; text-align: center; }
-        .logs { background: #0d1117; border: 1px solid #333; border-radius: 8px; padding: 10px; height: 300px; overflow-y: auto; font-size: 11px; }
-        .log-line { border-bottom: 1px solid #1a1a1a; padding: 4px 0; }
-        button { background: #0f0; color: #000; border: none; padding: 10px 20px; margin: 5px; cursor: pointer; font-weight: bold; border-radius: 5px; font-size: 16px; }
-        button:hover { background: #0c0; }
-        .stop-btn { background: #f00; color: #fff; }
-        .footer { text-align: center; font-size: 10px; color: #444; margin-top: 20px; padding-top: 10px; border-top: 1px solid #333; }
-        .running { color: #0f0; }
-        .stopped { color: #f00; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e5e5e5; padding: 16px; }
+       .container { max-width: 800px; margin: 0 auto; }
+       .header { text-align: center; padding: 20px 0 16px; }
+       .header h1 { font-size: 1.5em; font-weight: 700; margin-bottom: 4px; background: linear-gradient(135deg, #3b82f6, #8b5cf6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+       .header p { font-size: 0.85em; color: #737373; }
+       .stats { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 16px; }
+       .stat { background: #171717; padding: 12px; border-radius: 8px; flex: 1; text-align: center; border: 1px solid #262626; }
+       .stat-val { font-size: 1.3em; font-weight: 700; color: #3b82f6; }
+       .stat-label { font-size: 0.7em; color: #737373; margin-top: 2px; }
+       .opps { display: flex; flex-direction: column; gap: 10px; }
+       .card { background: #171717; border: 1px solid #262626; border-radius: 12px; padding: 14px; display: flex; align-items: center; gap: 12px; transition: all 0.2s; }
+       .card:hover { border-color: #3b82f6; transform: translateY(-1px); }
+       .ex-box { background: #262626; padding: 8px 10px; border-radius: 8px; min-width: 90px; }
+       .ex-line { font-size: 0.75em; font-weight: 700; line-height: 1.4; }
+       .buy-text { color: #fbbf24; }
+       .sell-text { color: #fbbf24; }
+       .ex-name { color: #e5e5e5; margin-left: 4px; }
+       .pair-info { flex: 1; }
+       .pair-name { font-size: 1.1em; font-weight: 700; color: #fafafa; margin-bottom: 2px; }
+       .liquidity { font-size: 0.8em; color: #a3a3a3; }
+       .verified { font-size: 0.7em; color: #fbbf24; margin-top: 2px; }
+       .spread-box { text-align: right; }
+       .spread-val { font-size: 1.4em; font-weight: 700; color: #4ade80; }
+       .empty { text-align: center; padding: 60px 20px; color: #525252; }
+       .pulse { animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        @media (max-width: 480px) {
+           .card { padding: 12px; gap: 8px; }
+           .ex-box { min-width: 80px; padding: 6px 8px; }
+           .pair-name { font-size: 1em; }
+           .spread-val { font-size: 1.2em; }
+        }
     </style>
+    <script>
+        function timeAgo(ts) {
+            const sec = Math.floor((Date.now() - ts) / 1000);
+            if (sec < 60) return sec + ' seconds ago';
+            return Math.floor(sec / 60) + ' minutes ago';
+        }
+        async function refresh() {
+            try {
+                const res = await fetch('/api/opportunities');
+                const data = await res.json();
+                document.getElementById('oppCount').textContent = data.opportunities.length;
+                document.getElementById('bestSpread').textContent = data.best_spread || '0%';
+                document.getElementById('pairsCount').textContent = data.pairs_monitored;
+                const container = document.getElementById('opps');
+                if (!data.opportunities.length) {
+                    container.innerHTML = '<div class="empty pulse">Scanning ' + data.pairs_monitored + ' pairs across ' + data.exchanges + ' exchanges...</div>';
+                    return;
+                }
+                container.innerHTML = data.opportunities.map(o => `
+                    <div class="card">
+                        <div class="ex-box">
+                            <div class="ex-line"><span class="buy-text">BUY</span><span class="ex-name">${o.buy_ex.toUpperCase()}</span></div>
+                            <div class="ex-line"><span class="sell-text">SELL</span><span class="ex-name">${o.sell_ex.toUpperCase()}</span></div>
+                        </div>
+                        <div class="pair-info">
+                            <div class="pair-name">${o.pair}</div>
+                            <div class="liquidity">Liquidity: $${o.liquidity.toLocaleString()}</div>
+                            <div class="verified">Last Verified ${timeAgo(o.ts)}</div>
+                        </div>
+                        <div class="spread-box">
+                            <div class="spread-val">${o.spread}%</div>
+                        </div>
+                    </div>
+                `).join('');
+            } catch(e) { console.error(e); }
+        }
+        setInterval(refresh, 1000);
+        refresh();
+    </script>
 </head>
 <body>
     <div class="container">
-        <h1>⚡ TRIANGULAR ARBITRAGE BOT ⚡</h1>
-        
-        <div id="stats" class="stats"></div>
-        
-        <div class="section">
-            <div class="section-title">🏆 BEST OPPORTUNITY</div>
-            <div id="best"></div>
+        <div class="header">
+            <h1>Arbitrage Scanner</h1>
+            <p>Real-time spot opportunities across ${len(EXCHANGE_IDS)} exchanges</p>
         </div>
-        
-        <div class="section">
-            <div class="section-title">🔥 ALL PROFITABLE OPPORTUNITIES</div>
-            <div id="opportunities"></div>
+        <div class="stats">
+            <div class="stat"><div class="stat-val" id="oppCount">0</div><div class="stat-label">Opportunities</div></div>
+            <div class="stat"><div class="stat-val" id="bestSpread">0%</div><div class="stat-label">Best Spread</div></div>
+            <div class="stat"><div class="stat-val" id="pairsCount">0</div><div class="stat-label">Pairs Live</div></div>
         </div>
-        
-        <div class="section">
-            <div class="section-title">📊 LIVE MARKET PRICES</div>
-            <div id="prices" class="market-grid"></div>
-        </div>
-        
-        <div class="section">
-            <div class="section-title">📝 LIVE LOGS</div>
-            <div id="logs" class="logs"></div>
-        </div>
-        
-        <div style="text-align: center;">
-            <button onclick="startBot()">▶ START BOT</button>
-            <button onclick="stopBot()" class="stop-btn">⏹ STOP BOT</button>
-            <button onclick="refresh()">🔄 REFRESH</button>
-        </div>
-        
-        <div class="footer">
-            💰 Trade: $""" + str(TRADE_AMOUNT) + """ | 🎯 Min Profit: """ + str(MIN_PROFIT) + """% | 💸 Fee: 0.2% | Mode: """ + ("DRY RUN" if DRY_RUN else "LIVE") + """
+        <div class="opps" id="opps">
+            <div class="empty pulse">Initializing...</div>
         </div>
     </div>
-    
-    <script>
-        async function refresh() {
-            try {
-                const res = await fetch('/api/status');
-                const data = await res.json();
-                const balance = await fetch('/api/balance').then(r => r.json());
-                
-                document.getElementById('stats').innerHTML = `
-                    <div class="card"><div>💰 USDT BALANCE</div><div class="card-value">$${balance.usdt?.toFixed(2) || '0'}</div></div>
-                    <div class="card"><div>📊 TOTAL P&L</div><div class="card-value ${data.total_profit >= 0 ? 'profit-pct' : ''}">$${data.total_profit.toFixed(4)}</div></div>
-                    <div class="card"><div>🎯 TRADES</div><div class="card-value">${data.trades}</div></div>
-                    <div class="card"><div>⚡ STATUS</div><div class="card-value ${data.running ? 'running' : 'stopped'}">${data.running ? 'RUNNING' : 'STOPPED'}</div></div>
-                `;
-                
-                if (data.best && data.best.pct > 0) {
-                    document.getElementById('best').innerHTML = `<div class="opportunity opportunity-best"><strong>${data.best.route}</strong><br><span class="profit-pct">${data.best.pct.toFixed(4)}%</span> <span class="profit-usd">($${data.best.profit.toFixed(4)})</span></div>`;
-                } else {
-                    document.getElementById('best').innerHTML = '<div class="opportunity">🔍 Waiting for opportunities...</div>';
-                }
-                
-                if (data.all_opportunities && data.all_opportunities.length > 0) {
-                    document.getElementById('opportunities').innerHTML = data.all_opportunities.map(o => `
-                        <div class="opportunity">
-                            <strong>${o.route}</strong><br>
-                            <span class="profit-pct">${o.pct.toFixed(4)}%</span> <span class="profit-usd">($${o.profit.toFixed(4)})</span>
-                        </div>
-                    `).join('');
-                } else {
-                    document.getElementById('opportunities').innerHTML = '<div class="opportunity">🔍 No profitable opportunities found...</div>';
-                }
-                
-                const prices = await fetch('/api/prices').then(r => r.json());
-                const priceKeys = Object.keys(prices).slice(0, 8);
-                document.getElementById('prices').innerHTML = priceKeys.map(k => `<div class="market-card"><strong>${k}</strong><br>$${prices[k].toFixed(2)}</div>`).join('');
-                
-                const logs = await fetch('/api/logs').then(r => r.json());
-                document.getElementById('logs').innerHTML = logs.logs.slice().reverse().slice(0, 40).map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('');
-            } catch(e) { console.error(e); }
-        }
-        
-        function escapeHtml(t) { if (!t) return ''; return t.replace(/[&<>]/g, m => m === '&' ? '&amp;' : m === '<' ? '&lt;' : '&gt;'); }
-        
-        async function startBot() { await fetch('/start'); setTimeout(refresh, 1000); }
-        async function stopBot() { await fetch('/stop'); setTimeout(refresh, 1000); }
-        
-        setInterval(refresh, 2000);
-        refresh();
-    </script>
 </body>
 </html>
 """
 
-# =========================
-# API ENDPOINTS
-# =========================
-@app.on_event("startup")
-async def startup():
-    await init()
+async def init_exchanges():
+    for ex_id in EXCHANGE_IDS:
+        try:
+            ex_class = getattr(ccxtpro, ex_id)
+            state.exchanges[ex_id] = ex_class({'enableRateLimit': True, 'options': {'defaultType': 'spot'}, 'timeout': 30000})
+            await state.exchanges[ex_id].load_markets()
+            logger.info(f"Loaded {ex_id}: {len(state.exchanges[ex_id].markets)} markets")
+        except Exception as e:
+            logger.error(f"Failed {ex_id}: {e}")
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTML
+async def load_currencies():
+    for ex_id, ex in state.exchanges.items():
+        try:
+            async with state.rate_limiters[ex_id]:
+                state.currencies[ex_id] = await ex.fetch_currencies()
+            logger.info(f"Loaded currency status for {ex_id}")
+        except Exception as e:
+            logger.warning(f"Could not load currencies for {ex_id}: {e}")
 
-@app.get("/start")
-async def start():
-    if not state["running"]:
-        asyncio.create_task(engine())
-    state["stop"] = False
-    return {"status": "started"}
+async def filter_active_pairs():
+    for pair in PAIRS:
+        for ex_id, ex in state.exchanges.items():
+            if pair in ex.markets and ex.markets.get('active', True):
+                state.pair_availability.add(ex_id)
+    pair_scores = [(p, len(exs)) for p, exs in state.pair_availability.items()]
+    pair_scores.sort(key=lambda x: x[1], reverse=True)
+    state.active_pairs = [p[0] for p in pair_scores if p[1] >= 2]
+    logger.info(f"Monitoring {len(state.active_pairs)} pairs on 2+ exchanges")
+    return state.active_pairs
 
-@app.get("/stop")
-async def stop():
-    state["stop"] = True
-    state["running"] = False
-    return {"status": "stopped"}
+def calc_fill_price(book_side, amount_usd):
+    remaining = amount_usd
+    total_base = 0
+    total_cost = 0
+    for price, qty in book_side:
+        level_usd = price * qty
+        if remaining >= level_usd:
+            total_base += qty
+            total_cost += level_usd
+            remaining -= level_usd
+        else:
+            partial_qty = remaining / price
+            total_base += partial_qty
+            total_cost += remaining
+            remaining = 0
+            break
+    if total_base == 0:
+        return 0, 0, True
+    return total_cost / total_base, total_base, remaining > 1
 
-@app.get("/api/status")
-async def status():
+def check_deposits_ok(exchange, coin):
+    if exchange not in state.currencies:
+        return True
+    coin_data = state.currencies[exchange].get(coin)
+    if not coin_data:
+        return True
+    return coin_data.get('active', True) and coin_data.get('withdraw', True) and coin_data.get('deposit', True)
+
+async def check_arbitrage(pair):
+    if len(state.orderbooks) < 2:
+        return
+    now = int(time.time() * 1000)
+    base = pair.split('/')[0]
+    for trade_usd in TRADE_SIZES:
+        for buy_ex, buy_ob in state.orderbooks.items():
+            if not check_deposits_ok(buy_ex, base):
+                continue
+            for sell_ex, sell_ob in state.orderbooks.items():
+                if buy_ex == sell_ex or not check_deposits_ok(sell_ex, base):
+                    continue
+                if now - buy_ob['ts'] > STALE_BOOK_MS or now - sell_ob['ts'] > STALE_BOOK_MS:
+                    continue
+                buy_price, buy_qty, buy_partial = calc_fill_price(buy_ob['asks'], trade_usd)
+                if buy_partial or buy_qty == 0:
+                    continue
+                sell_price, sell_qty, sell_partial = calc_fill_price(sell_ob['bids'], buy_qty * sell_price)
+                if sell_partial or sell_qty < buy_qty * 0.97:
+                    continue
+                buy_fee = FEES[buy_ex]['taker']
+                sell_fee = FEES[sell_ex]['taker']
+                buy_cost = buy_qty * buy_price * (1 + buy_fee)
+                sell_rev = buy_qty * sell_price * (1 - sell_fee)
+                profit = sell_rev - buy_cost
+                spread = profit / trade_usd * 100
+                if spread >= MIN_SPREAD:
+                    liquidity = min(buy_ob['asks'][0][0] * buy_ob['asks'][0][1],
+                                   sell_ob['bids'][0][0] * sell_ob['bids'][0][1])
+                    opp = {
+                        'pair': pair, 'buy_ex': buy_ex, 'sell_ex': sell_ex,
+                        'buy_price': f"{buy_price:.8f}".rstrip('0').rstrip('.'),
+                        'sell_price': f"{sell_price:.8f}".rstrip('0').rstrip('.'),
+                        'spread': round(spread, 1), 'profit': round(profit, 2),
+                        'size_usd': trade_usd, 'liquidity': int(liquidity), 'ts': now
+                    }
+                    await handle_opportunity(opp)
+                    return
+
+async def handle_opportunity(opp):
+    state.opportunities = [o for o in state.opportunities if time.time() * 1000 - o['ts'] < OPP_EXPIRE_MS]
+    existing = next((o for o in state.opportunities if o['pair'] == opp['pair']), None)
+    if existing and existing['spread'] >= opp['spread']:
+        return
+    if existing:
+        state.opportunities.remove(existing)
+    state.opportunities.append(opp)
+    state.opportunities.sort(key=lambda x: x['spread'], reverse=True)
+    state.opportunities = state.opportunities[:100]
+    state.last_update = datetime.now()
+    opp_key = f"{opp['pair']}_{opp['buy_ex']}_{opp['sell_ex']}"
+    if TELEGRAM_TOKEN and time.time() - state.alerted_opps.get(opp_key, 0) > 600:
+        state.alerted_opps[opp_key] = time.time()
+        asyncio.create_task(send_telegram(opp))
+
+async def send_telegram(opp):
+    try:
+        import aiohttp
+        msg = (f"🚨 {opp['pair']} {opp['spread']}%\n"
+               f"BUY {opp['buy_ex'].upper()} ${opp['buy_price']}\n"
+               f"SELL {opp['sell_ex'].upper()} ${opp['sell_price']}\n"
+               f"${opp['size_usd']} | Liq: ${opp['liquidity']} | +${opp['profit']}")
+        async with aiohttp.ClientSession() as s:
+            await s.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                        json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    except: pass
+
+async def watch_orderbook(exchange, pair):
+    task_key = f"{exchange.id}_{pair}"
+    while True:
+        try:
+            ob = await exchange.watch_order_book(pair, limit=ORDERBOOK_DEPTH)
+            if ob['bids'] and ob['asks']:
+                state.orderbooks[exchange.id] = {
+                    'bids': ob['bids'][:ORDERBOOK_DEPTH],
+                    'asks': ob['asks'][:ORDERBOOK_DEPTH],
+                    'ts': exchange.milliseconds()
+                }
+                await check_arbitrage(pair)
+        except Exception as e:
+            logger.debug(f"WS {task_key}: {e}")
+            await exchange.sleep(5000)
+
+async def scanner_loop():
+    await init_exchanges()
+    await load_currencies()
+    pairs = await filter_active_pairs()
+    ws_count = 0
+    for pair in pairs:
+        for ex_id in state.pair_availability:
+            if ws_count >= MAX_WS_TOTAL:
+                logger.warning(f"Hit MAX_WS_TOTAL={MAX_WS_TOTAL}. Monitoring {ws_count} streams")
+                break
+            if ex_id not in state.exchanges:
+                continue
+            ex = state.exchanges[ex_id]
+            task_key = f"{ex_id}_{pair}"
+            state.ws_tasks[task_key] = asyncio.create_task(watch_orderbook(ex, pair))
+            ws_count += 1
+        if ws_count >= MAX_WS_TOTAL:
+            break
+    logger.info(f"Started {ws_count} WebSocket streams")
+    await asyncio.gather(*state.ws_tasks.values(), return_exceptions=True)
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, PAIRS=PAIRS, MIN_TRADE_USD=MIN_TRADE_USD,
+                                 MAX_TRADE_USD=MAX_TRADE_USD, MIN_SPREAD=MIN_SPREAD)
+
+@app.route('/api/opportunities')
+def api_opps():
+    now = time.time() * 1000
+    for o in state.opportunities:
+        o['age'] = int((now - o['ts']) / 1000)
+    return jsonify({
+        'opportunities': state.opportunities,
+        'best_spread': f"{state.opportunities[0]['spread']}%" if state.opportunities else "0%",
+        'pairs_monitored': len(state.active_pairs),
+        'ws_connections': len(state.ws_tasks),
+        'exchanges': len(EXCHANGE_IDS),
+        'last_update': state.last_update.strftime('%H:%M:%S') if state.last_update else None
+    })
+
+@app.route('/health')
+def health():
     return {
-        "running": state["running"],
-        "trades": state["trades"],
-        "total_profit": state["total_profit"],
-        "best": state["best"],
-        "all_opportunities": state["all_opportunities"]
+        'status': 'ok', 'pairs_total': len(PAIRS), 'pairs_active': len(state.active_pairs),
+        'opps': len(state.opportunities), 'ws': len(state.ws_tasks)
     }
 
-@app.get("/api/logs")
-async def get_logs():
-    return {"logs": state["logs"]}
+def run_scanner():
+    asyncio.run(scanner_loop())
 
-@app.get("/api/balance")
-async def get_balance():
-    try:
-        balance = await exchange.fetch_balance()
-        return {"usdt": balance.get("USDT", {}).get("free", 0)}
-    except:
-        return {"usdt": 0}
-
-@app.get("/api/prices")
-async def get_prices():
-    return {k: round(v.get("bid", 0), 2) for k, v in state["prices"].items() if v.get("bid", 0) > 0}
-
-# =========================
-# RUN
-# =========================
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    threading.Thread(target=run_scanner, daemon=True).start()
+    logger.info(f"🚀 Scanner: {len(PAIRS)} coins, {len(EXCHANGE_IDS)} exchanges")
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
